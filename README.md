@@ -40,6 +40,6 @@ We implemented a comparative framework to determine the most accurate model for 
 ---
 
 ## 📂 Repository Structure
-* `data/`: Cleaned datasets (anonymized).
+* `data/`: datasets.
 * `scripts/`: R scripts for EDA, Spatial Engineering, and Modeling.
-* `output/`: 3D Renders, maps, and model performance metrics.
+* `output/`: figures.
