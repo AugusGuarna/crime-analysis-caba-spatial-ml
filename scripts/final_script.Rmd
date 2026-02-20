@@ -1,0 +1,1705 @@
+---
+title: "TP Final"
+output:
+  html_document: default
+  pdf_document: default
+date: "2025-07-18"
+---
+
+Antes de comenzar cargaremos todas las librerías necesarias para tenerlas todas en un solo lugar.
+```{r}
+#Cargo librerias
+library(tidyverse)
+library(dplyr)
+library(readxl)
+library(ggplot2)
+library(terra)
+library(sf)
+library("leaflet")
+```
+
+Ahora cargamos los datos correspondientes a los distintos años y los juntamos todos en un mismo dataset.
+```{r}
+#Cargo datos
+datos2022 <- read.csv("./delitos_2022.csv")
+datos2023 <- read_csv("./delitos_2023.csv")
+datos2024 <- read.csv("./delitos_2024.csv")
+
+#Junto todo
+datos2022$fecha <- as.Date(datos2022$fecha)
+datos2023$fecha <- as.Date(datos2023$fecha)
+datos2024$fecha <- as.Date(datos2024$fecha)
+datos2022$franja <- as.numeric(datos2022$franja)
+datos2023$franja <- as.numeric(datos2023$franja)
+datos2024$franja <- as.numeric(datos2024$franja)
+
+datos2022 <- datos2022 %>% select(-id.mapa)
+datos2023 <- datos2023 %>% select(-"id-mapa")
+datos2024 <- datos2024 %>% select(-id.mapa)
+```
+Juntamos todos
+
+```{r}
+delitos <- bind_rows(datos2022,datos2023,datos2024)
+```
+
+Ignoramos los que tengan NULL en la columna barrio y comuna y nos quedamos solo con un subconjunto de los delitos: Robo total, Hurto total, Robo automotor y Hurto automotor. Que sea total implica que incluye robos o hurtos con arma y sin arma.
+
+```{r}
+delitos <- delitos %>% filter(barrio != "NULL")
+delitos <- delitos %>% filter(comuna != "NULL")
+delitos <- delitos %>% filter(subtipo == "Robo total" | subtipo == "Hurto total" | subtipo == "Robo automotor" | subtipo == "Hurto automotor")
+# Vemos que no tengamos NAs
+any(is.na(delitos))
+```
+Contamos la cantidad de los distintos tipos de delitos por barrio.
+
+```{r}
+tabla_resumen <- delitos %>%
+  filter(barrio != "NULL" & !is.na(barrio)) %>%
+  count(barrio, subtipo) %>%
+  pivot_wider(names_from = subtipo, values_from = n, values_fill = 0) %>%
+  mutate(total_delitos = rowSums(across(where(is.numeric))))
+
+tabla_resumen <- tabla_resumen %>%
+  arrange(desc(total_delitos))
+tabla_resumen
+```
+
+Veamos si efectivamente Palermo es el barrio donde se produce la mayor cantidad de delitos.
+
+```{r}
+delitos_largos <- tabla_resumen %>%
+  pivot_longer(cols = -barrio, names_to = "tipo_delito", values_to = "cantidad")
+```
+
+```{r}
+delitos_subset_hurto <- tabla_resumen %>%
+  select(barrio, "Hurto total", "Hurto automotor") %>%
+  pivot_longer(cols = -barrio, names_to = "tipo_hurto", values_to = "cantidad")
+
+ggplot(delitos_subset_hurto, aes(x = barrio, y = cantidad, fill = tipo_hurto)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Hurto y Hurto Automotor por barrio",
+       x = "Barrio", y = "Cantidad") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust=1, vjust=0.4, size=6))
+```
+
+```{r}
+delitos_subset_robo <- tabla_resumen %>%
+  select(barrio, "Robo total", "Robo automotor") %>%
+  pivot_longer(cols = -barrio, names_to = "tipo_robo", values_to = "cantidad")
+
+ggplot(delitos_subset_robo, aes(x = barrio, y = cantidad, fill = tipo_robo)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Robo y Robo Automotor por barrio",
+       x = "Barrio", y = "Cantidad") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust=1, vjust=0.4, size=6))
+```
+
+```{r}
+delitos_subset_total <- tabla_resumen %>%
+  select(barrio, "total_delitos") %>%
+  pivot_longer(cols = -barrio, names_to = "total_delitos", values_to = "cantidad")
+
+ggplot(delitos_subset_total, aes(x = barrio, y = cantidad, fill = total_delitos)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Total delitos por barrio",
+       x = "Barrio", y = "Cantidad") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust=1, vjust=0.4, size=6))
+```
+
+Vemos que efectivamente Palermo es el barrio donde más delitos se producen y aún más, desestimaremos  robo y hurto automotor porque son muy pocos los casos en comparación con los de hurto y robo. Como Palermo es el barrio con más delitos solo nos quedaremos con sus datos y además con los datos de Robo total y Hurto total.
+
+```{r}
+delitos <- delitos %>% filter(barrio == "PALERMO")
+delitos <- delitos %>% filter(subtipo == "Robo total" | subtipo == "Hurto total")
+```
+Para evitar redundancia en los datos, hay varias columnas que podemos eliminar. Estas son subtipo (pues tipo ya lo define), barrio y comuna (porque todos los delitos ocurrieron en Palermo) y cantidad porque todas las filas tienen 1.
+
+```{r}
+delitos <- delitos %>% select(-subtipo, -barrio, -comuna, -cantidad)
+```
+
+Armamos un objeto espacial del dataset.
+```{r}
+delitos.sf = delitos %>% st_as_sf(coords = c("longitud", "latitud"), crs = 4326)
+delitos.sf
+```
+
+Hagamos una visualización simple para ver si aporta información. 
+```{r}
+plot(delitos.sf)
+```
+Esto es si graficamos todo junto. No es lo mejor definitivamente. Empecemos a segmentar.
+Graficar todos los delitos juntos mucha información vimos que no aporta pues todo Palermo representa una zona donde se roba. Aún más, los espacios en blanco corresponden con espacios verdes o zonas no accesibles para el público.
+
+Corroboremos esto último graficando las calles del barrio.
+```{r}
+calles.comp <- st_read("./callejero/")
+calles<-calles.comp[,c("id","tipo_c","nom_mapa","BARRIO", "long")]
+```
+
+```{r}
+calles <- calles %>% filter(BARRIO == "PALERMO")
+avenidas <- calles %>% filter(tipo_c == "AVENIDA")
+```
+
+```{r}
+ggplot(calles) +
+  geom_sf(size = 0.3) +
+  theme_minimal()
+```
+
+```{r}
+ggplot() +
+  geom_sf(data = calles, color = "gray80", size = 0.3) +
+  geom_sf(data = delitos.sf, aes(color = as.factor(anio)), size = 0.3) +
+  scale_color_brewer(palette = "Set1", name = "Año") +
+  theme_minimal()
+
+```
+
+
+```{r}
+leaflet(delitos.sf) %>% addTiles() %>% addCircleMarkers(radius=0.2)
+```
+Con esto confirmamos lo que discutíamos arriba. Ahora segmentemos los delitos según año, tipo y ambos en simultáneo para poder ver si aparece alguna tendencia obvia.
+
+Hagamos este mismo gráfico pero primero:
+1. Separando por año
+2. Segmentando por tipo de delito
+3. Segmentando por año y tipo de delito
+
+```{r}
+
+pal <- colorFactor(palette = "Set1", domain = delitos.sf$anio)
+
+leaflet(delitos.sf) %>%
+  addTiles() %>%
+  addCircleMarkers(radius = 0.5, color = ~pal(anio), stroke = FALSE, fillOpacity = 0.8) %>%
+  addLegend("bottomright", pal = pal, values = ~anio, title = "Año")
+
+```
+
+
+Veamos si efectivamente como parece la mayor proporción de robos se dio en 2024 con un histograma
+
+```{r}
+delitos.sf %>%
+  filter(tipo == "Robo") %>%
+  ggplot(aes(x = as.factor(anio))) +
+  geom_bar(fill = "steelblue") +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10)) + 
+  labs(
+    title = "Cantidad de Robos por Año",
+    x = "Año",
+    y = "Cantidad de Robos"
+  ) 
+```
+Vemos que justamente no. Fue por un tema de las etiquetas. Ahora hagamos el mapa para los 3 años separados.
+
+```{r}
+ggplot(delitos.sf, aes(color = as.factor(anio))) +
+  geom_sf(data = calles, color = "gray80", size = 0.3) +
+  geom_sf(size = 0.3) +
+  scale_color_brewer(palette = "Set1", name = "Año") +
+  facet_wrap(~ anio) +
+  theme_minimal() +
+  guides(color = "none")  
+```
+Se ve evidentemente que los delitos ocurren en todo Palermo y no parece haber un cambio notable según el año.
+
+Vamos a segmentar por tipo de robo pero de acuerdo al año.
+
+```{r}
+
+ggplot(delitos.sf, aes(x = tipo, fill = as.factor(uso_arma))) +
+  geom_bar(position = "dodge") +
+  facet_wrap(~ anio) +
+  labs(
+    x = "Tipo de delito",
+    y = "Cantidad",
+    fill = "Uso de arma",
+    title = "Delitos por Año, Tipo y Uso de Arma"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+Vamos a segmentar por año, uso de arma, uso de moto y tipo.
+```{r}
+ggplot(delitos.sf, aes(x = as.factor(uso_moto), fill = as.factor(uso_arma))) +
+  geom_bar(position = "dodge") +
+  facet_grid(anio ~ tipo) +
+  labs(
+    x = "Uso de moto",
+    y = "Cantidad",
+    fill = "Uso de arma",
+    title = "Delitos segmentados por Año, Tipo, Arma y Moto"
+  ) +
+  theme_minimal()
+```
+
+Vemos que aquellos delitos donde se usa moto o arma representan una menor proporción por lo tanto los desestimaremos.
+
+```{r}
+delitos.sf <- delitos.sf %>% select(-uso_moto)
+delitos.sf <- delitos.sf %>% select(-uso_arma)
+```
+
+Grafiquemos para un mismo año un mapa que contenga los dos tipos de delitos.
+```{r}
+anios <- sort(unique(delitos.sf$anio))
+mapas_por_anio <- map(anios, function(anio_actual) {
+  datos <- delitos.sf %>% filter(anio == anio_actual)
+  
+  pal <- colorFactor(palette = "Set1", domain = datos$tipo)
+  
+  leaflet(datos) %>%
+    addTiles() %>%
+    addCircleMarkers(
+      radius = 0.5,
+      color = ~pal(tipo),
+      stroke = FALSE,
+      fillOpacity = 0.8
+    ) %>%
+    addLegend("bottomright", pal = pal, values = ~tipo,
+              title = paste("Tipos de delito<br>Año:", anio_actual))
+})
+
+names(mapas_por_anio) <- as.character(anios)
+```
+
+```{r}
+mapas_por_anio[["2022"]]
+
+```
+
+```{r}
+mapas_por_anio[["2023"]]
+
+```
+
+
+```{r}
+mapas_por_anio[["2024"]]
+
+```
+
+Verlo todo junto no es lo mejor, decidimos graficar por año lado a lado para poder comparar.
+```{r}
+delitos_filtrados <- delitos.sf %>%
+  filter(tipo %in% c("Robo", "Hurto"),
+         anio == 2022)
+
+ggplot() +
+  geom_sf(data = calles, color = "gray80", size = 0.3) +
+  geom_sf(data = delitos_filtrados, size = 0.3) +
+  facet_wrap(~ tipo, nrow = 1) +
+  theme_minimal() + labs(title = "Mapa de delitos por tipo - Año 2022")
+```
+
+```{r}
+delitos_filtrados <- delitos.sf %>%
+  filter(tipo %in% c("Robo", "Hurto"),
+         anio == 2023)
+
+ggplot() +
+  geom_sf(data = calles, color = "gray80", size = 0.3) +
+  geom_sf(data = delitos_filtrados, size = 0.3) +
+  facet_wrap(~ tipo, nrow = 1) +
+  theme_minimal() + labs(title = "Mapa de delitos por tipo - Año 2023")
+```
+
+```{r}
+delitos_filtrados <- delitos.sf %>%
+  filter(tipo %in% c("Robo", "Hurto"),
+         anio == 2024)
+
+ggplot() +
+  geom_sf(data = calles, color = "gray80", size = 0.3) +
+  geom_sf(data = delitos_filtrados, size = 0.3) +
+  facet_wrap(~ tipo, nrow = 1) +
+  theme_minimal() + labs(title = "Mapa de delitos por tipo - Año 2024")
+```
+En los tres casos vemos que los mapas son similares, no parece haber una tendencia obvia. Palermo es peligroso en general.
+
+Veamos si podemos obtener más información segmentando de acuerdo a franja horaria.
+
+```{r}
+anio_interes <- 2022
+
+delitos.sf_franja <- delitos.sf
+delitos.sf_franja$franja <- factor(delitos.sf_franja$franja, levels = 0:23)
+
+delitos_anio <- delitos.sf_franja %>%
+  filter(anio == anio_interes)
+
+
+ggplot(delitos_anio, aes(x = franja)) +
+  geom_bar(fill = "steelblue") +
+  labs(
+    title = paste("Cantidad de delitos por hora - Año", anio_interes),
+    x = "Hora del día",
+    y = "Cantidad de delitos"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+anio_interes <- 2023
+
+delitos.sf_franja <- delitos.sf
+delitos.sf_franja$franja <- factor(delitos.sf_franja$franja, levels = 0:23)
+
+delitos_anio <- delitos.sf_franja %>%
+  filter(anio == anio_interes)
+
+ggplot(delitos_anio, aes(x = franja)) +
+  geom_bar(fill = "steelblue") +
+  labs(
+    title = paste("Cantidad de delitos por hora - Año", anio_interes),
+    x = "Hora del día",
+    y = "Cantidad de delitos"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+anio_interes <- 2024
+
+delitos.sf_franja <- delitos.sf
+delitos.sf_franja$franja <- factor(delitos.sf_franja$franja, levels = 0:23)
+
+delitos_anio <- delitos.sf_franja %>%
+  filter(anio == anio_interes)
+
+ggplot(delitos_anio, aes(x = franja)) +
+  geom_bar(fill = "steelblue") +
+  labs(
+    title = paste("Cantidad de delitos por hora - Año", anio_interes),
+    x = "Hora del día",
+    y = "Cantidad de delitos"
+  ) +
+  theme_minimal()
+```
+Se suele robar más a la tarde/noche, teorizamos que es por el flujo de gente (gente que sale de trabajar, gente que sale a comer, etc.), sin embargo, la varianza no parece ser tan alta, es por eso que decidimos ignorar esto para el análisis que sigue.
+
+Fijemonos si hay una tendencia mensual.
+
+```{r}
+anio_interes <- 2022
+
+meses_orden <- c("ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO",
+                 "JUNIO", "JULIO", "AGOSTO", "SEPTIEMBRE", "OCTUBRE",
+                 "NOVIEMBRE", "DICIEMBRE")
+
+delitos_anio <- delitos.sf %>%
+  filter(anio == anio_interes) %>%
+  mutate(
+    mes = factor(mes, levels = meses_orden)
+  )
+
+ggplot(delitos_anio, aes(x = mes)) +
+  geom_bar(fill = "steelblue") +
+  labs(
+    title = paste("Cantidad de delitos por mes - Año", anio_interes),
+    x = "Mes",
+    y = "Cantidad de delitos"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 6),  
+    axis.text.y = element_text(size = 6)   
+  )
+```
+
+```{r}
+
+anio_interes <- 2023
+
+meses_orden <- c("ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO",
+                 "JUNIO", "JULIO", "AGOSTO", "SEPTIEMBRE", "OCTUBRE",
+                 "NOVIEMBRE", "DICIEMBRE")
+
+delitos_anio <- delitos.sf %>%
+  filter(anio == anio_interes) %>%
+  mutate(
+    mes = factor(mes, levels = meses_orden)
+  )
+
+ggplot(delitos_anio, aes(x = mes)) +
+  geom_bar(fill = "steelblue") +
+  labs(
+    title = paste("Cantidad de delitos por mes - Año", anio_interes),
+    x = "Mes",
+    y = "Cantidad de delitos"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 6),  
+    axis.text.y = element_text(size = 6)   
+  )
+```
+
+```{r}
+
+anio_interes <- 2024
+
+
+meses_orden <- c("ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO",
+                 "JUNIO", "JULIO", "AGOSTO", "SEPTIEMBRE", "OCTUBRE",
+                 "NOVIEMBRE", "DICIEMBRE")
+
+delitos_anio <- delitos.sf %>%
+  filter(anio == anio_interes) %>%
+  mutate(
+    mes = factor(mes, levels = meses_orden)
+  )
+
+ggplot(delitos_anio, aes(x = mes)) +
+  geom_bar(fill = "steelblue") +
+  labs(
+    title = paste("Cantidad de delitos por mes - Año", anio_interes),
+    x = "Mes",
+    y = "Cantidad de delitos"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 6),  
+    axis.text.y = element_text(size = 6)   
+  )
+```
+No hay una tendencia clara en los robos por mes.
+
+Fijemonos si hay un hotspot espacial.
+```{r}
+delitos.sf_hs <- st_transform(delitos.sf, crs = 22185)
+calles_hs <- st_transform(calles, crs = 22185)
+
+
+coords_df <- delitos.sf_hs |>
+  mutate(anio = as.factor(anio)) |>
+  cbind(st_coordinates(delitos.sf_hs)) |>
+  st_drop_geometry()
+
+
+
+# Año 2022
+gg_2022 <- ggplot() +
+  geom_sf(data = calles_hs, color = "gray80", size = 0.2) +
+  stat_density_2d(data = filter(coords_df, anio == "2022"),
+                  aes(x = X, y = Y, fill = after_stat(level)),
+                  geom = "polygon", alpha = 0.5) +
+  scale_fill_viridis_c(name = "Densidad") +
+  ggtitle("Hotspots - Año 2022") +
+  theme_minimal() +
+  coord_sf()
+
+# Año 2023
+gg_2023 <- ggplot() +
+  geom_sf(data = calles_hs, color = "gray80", size = 0.2) +
+  stat_density_2d(data = filter(coords_df, anio == "2023"),
+                  aes(x = X, y = Y, fill = after_stat(level)),
+                  geom = "polygon", alpha = 0.5) +
+  scale_fill_viridis_c(name = "Densidad") +
+  ggtitle("Hotspots - Año 2023") +
+  theme_minimal() +
+  coord_sf()
+
+# Año 2024
+gg_2024 <- ggplot() +
+  geom_sf(data = calles_hs, color = "gray80", size = 0.2) +
+  stat_density_2d(data = filter(coords_df, anio == "2024"),
+                  aes(x = X, y = Y, fill = after_stat(level)),
+                  geom = "polygon", alpha = 0.5) +
+  scale_fill_viridis_c(name = "Densidad") +
+  ggtitle("Hotspots - Año 2024") +
+  theme_minimal() +
+  coord_sf()
+
+# Mostrarlos individualmente
+gg_2022
+gg_2023
+gg_2024
+
+```
+Grafiquemos los hotspots de manera interactiva para ver qué zonas son las que marca el mapa de arriba.
+
+Importemos unas librerías que serán utilizadas a partir de esta parte.
+
+```{r}
+library(purrr)
+library(MASS)
+library(raster)
+library(caret)
+library(pROC)
+library(randomForest)
+library(xgboost)
+library(gridExtra)
+```
+
+
+```{r}
+delitos_proj <- st_transform(delitos.sf, 22185)
+calles_proj <- st_transform(calles, 22185)
+
+
+coords_df <- delitos_proj |>
+  mutate(anio = as.factor(anio)) |>
+  cbind(st_coordinates(delitos_proj)) |>
+  st_drop_geometry()
+crear_mapa_leaflet <- function(df_anio, calles, titulo) {
+
+  dens <- kde2d(df_anio$X, df_anio$Y, n = 200)
+  
+  r <- raster(list(x = dens$x, y = dens$y, z = dens$z))
+  crs(r) <- CRS("+init=epsg:22185")  # EPSG del raster original
+  r <- projectRaster(r, crs = CRS("+init=epsg:4326"))  # reproyectar a WGS84 para leaflet
+
+
+  calles_wgs <- st_transform(calles, 4326)
+
+  leaflet() |>
+    addTiles() |>
+    addRasterImage(r, colors = colorNumeric("viridis", values(r), na.color = NA), opacity = 0.5) |>
+    addPolylines(data = calles_wgs, color = "gray", weight = 0.7) |>
+    addLegend(pal = colorNumeric("viridis", values(r), na.color = NA),
+              values = values(r), title = "Densidad", position = "bottomright") |>
+    addControl(titulo, position = "topright")
+}
+
+```
+
+```{r}
+# Filtrar por año
+df_2022 <- filter(coords_df, anio == "2022")
+df_2023 <- filter(coords_df, anio == "2023")
+df_2024 <- filter(coords_df, anio == "2024")
+
+# Generar mapas
+mapa_2022 <- crear_mapa_leaflet(df_2022, calles_proj, "Hotspots 2022")
+mapa_2023 <- crear_mapa_leaflet(df_2023, calles_proj, "Hotspots 2023")
+mapa_2024 <- crear_mapa_leaflet(df_2024, calles_proj, "Hotspots 2024")
+
+# Mostrar (uno a la vez en RStudio Viewer)
+mapa_2022
+mapa_2023
+mapa_2024
+
+```
+
+Vemos que los hotspots fueron variando a lo largo de los años pero que de 2022 a 2023 hay una gran diferencia. Por ello, si se busca armar un modelo predictivo se debe descartar aprender del 2022 puesto que va a añadir cierto sesgo al modelo y creemos que puede ser perjudicial. 
+
+Nosotros ahora armaremos diferentes modelos y para ello entrenaremos con todo el 2023 y luego predeciremos los valores de 2024. A la hora de hacer modelos con datos temporales es muy importante no mezclar la fecha de los sucesos.
+
+
+```{r}
+delitos_filtrado <- delitos.sf %>% 
+  filter(anio != 2022)
+
+
+meses_ordenados <- c("ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO",
+                     "JULIO", "AGOSTO", "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE")
+
+delitos_filtrado <- delitos_filtrado %>%
+  mutate(mes_num = match(mes, meses_ordenados))
+
+
+preTrain <- delitos_filtrado %>%
+  filter(anio == 2023 | (anio == 2024 & mes_num <= 9))
+
+Train <- preTrain  %>%
+  filter(anio == 2023 | (anio == 2024 & mes_num <= 6))
+
+Test <- preTrain %>%
+  filter(anio == 2023 | (anio == 2024 & mes_num <= 9 & mes_num > 6 ))
+
+Validation <- delitos_filtrado %>%
+  filter(anio == 2024 & mes_num >= 10)
+
+```
+
+Entrenaremos 3 modelos muy utilizados para clasificación binaria: regresión logística, Random Forest y XGBoost.
+
+```{r}
+crear_dataset_espacial_optimizado <- function(delitos_sf, tipo_delito, columna_delito, cell_size) {
+
+  # Filtrar por tipo de delito
+  delitos_tipo <- delitos_sf %>%
+    filter(grepl(tipo_delito, .data[[columna_delito]], ignore.case = TRUE))
+
+  # Transformar CRS si es necesario
+  if(st_is_longlat(delitos_tipo) || st_crs(delitos_tipo)$epsg == 4326) {
+    delitos_tipo <- st_transform(delitos_tipo, crs = 5347)
+  }
+
+  # Crear grilla
+  grid <- st_make_grid(delitos_tipo, cellsize = cell_size, square = TRUE)
+  grid_sf <- st_sf(grid_id = 1:length(grid), geometry = grid)
+
+  # Contar delitos por celda
+  delitos_por_celda <- suppressWarnings(st_intersects(grid_sf, delitos_tipo))
+  grid_sf$delitos_count <- lengths(delitos_por_celda)
+
+  # Variable target binaria
+  grid_sf$tiene_delito <- as.factor(ifelse(grid_sf$delitos_count > 0, 1, 0))
+
+  # Verificar que tenemos ambas clases
+  casos_positivos <- sum(grid_sf$tiene_delito == "1")
+  casos_negativos <- sum(grid_sf$tiene_delito == "0")
+
+  # Extraer coordenadas del centroide
+  centroides <- suppressWarnings(st_centroid(grid_sf))
+  coords <- st_coordinates(centroides)
+  grid_sf$x <- coords[,1]
+  grid_sf$y <- coords[,2]
+
+  # Features espaciales
+  grid_sf <- grid_sf %>%
+    mutate(
+      # Coordenadas normalizadas
+      x_norm = scale(x)[,1],
+      y_norm = scale(y)[,1],
+
+      # Distancia al centro
+      dist_centro = sqrt((x - mean(x))^2 + (y - mean(y))^2),
+      dist_centro_norm = scale(dist_centro)[,1],
+
+      # Cuadrantes
+      cuadrante = case_when(
+        x >= mean(x) & y >= mean(y) ~ "NE",
+        x < mean(x) & y >= mean(y) ~ "NW",
+        x < mean(x) & y < mean(y) ~ "SW",
+        TRUE ~ "SE"
+      ),
+
+      # Densidad local simplificada
+      densidad_local = delitos_count
+    )
+
+  # Densidad local normalizada
+  grid_sf$densidad_local_norm <- scale(grid_sf$densidad_local)[,1]
+
+  return(grid_sf)
+}
+
+```
+
+```{r}
+entrenar_evaluar_logistica <- function(train_data, test_data, tipo_delito, columna_delito, cell_size) {
+  
+  # Crear datasets
+  train_sf <- crear_dataset_espacial_optimizado(train_data, tipo_delito, columna_delito, cell_size)
+  test_sf <- crear_dataset_espacial_optimizado(test_data, tipo_delito, columna_delito, cell_size)
+  
+  # Convertir a dataframe
+  train_df <- train_sf %>%
+    st_drop_geometry() %>%
+    dplyr::select(tiene_delito, x_norm, y_norm, dist_centro_norm, 
+           densidad_local_norm, cuadrante)
+  
+  test_df <- test_sf %>%
+    st_drop_geometry() %>%
+    dplyr::select(tiene_delito, x_norm, y_norm, dist_centro_norm, 
+           densidad_local_norm, cuadrante)
+  
+  # Entrenar modelo
+  modelo <- glm(tiene_delito ~ x_norm + y_norm + dist_centro_norm + 
+                densidad_local_norm + cuadrante,
+                data = train_df, 
+                family = binomial())
+  
+  # Predicciones
+  pred_prob <- predict(modelo, test_df, type = "response")
+  
+  # Calcular AUC
+  roc_obj <- roc(test_df$tiene_delito, pred_prob, quiet = TRUE)
+  auc_val <- as.numeric(auc(roc_obj))
+  
+  # Métricas adicionales
+  pred_class <- factor(ifelse(pred_prob > 0.5, "1", "0"), levels = c("0", "1"))
+  cm <- confusionMatrix(pred_class, test_df$tiene_delito, positive = "1")
+  
+  test_sf$pred_prob <- pred_prob
+  test_sf$pred_class <- pred_class
+  
+  
+  # GRÁFICO 1: Ocurrencia de delitos reales por celda
+  grafico_reales <- ggplot(test_sf) +
+    geom_sf(aes(fill = as.numeric(as.character(tiene_delito))), color = NA, size = 0.1) +
+    geom_sf(data = calles_hs, color = "gray80", size = 0.2) +
+    scale_fill_gradient(
+      low = "white", 
+      high = "red", 
+      name = "Delito\nReal",
+      breaks = c(0, 1), 
+      labels = c("No", "Sí")
+    ) +
+    ggtitle(paste("Delitos Reales -", tipo_delito, 
+                  "\n(Cell size:", cell_size, "m)")) +
+    theme_minimal() +
+    theme(
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+      legend.position = "right",
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+    )
+  
+  # GRÁFICO 2: Probabilidad predicha por celda
+  grafico_probabilidades <- ggplot(test_sf) +
+    geom_sf(aes(fill = pred_prob), color = NA, size = 0.1) +
+    geom_sf(data = calles_hs, color = "gray80", size = 0.2) +
+    scale_fill_gradient(
+      low = "white", 
+      high = "blue", 
+      name = "Prob.\nPredicha",
+      limits = c(0, 1)
+    ) +
+    ggtitle(paste("Probabilidades Predichas - Regresión Logística", tipo_delito,
+                  "\n(Cell size:", cell_size, "m | AUC:", round(auc_val, 3), ")")) +
+    theme_minimal() +
+    theme(
+      axis.text = element_blank(),
+      axis.ticks = element_blank(), 
+      panel.grid = element_blank(),
+      legend.position = "right",
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+    )
+  
+  return(list(
+    auc = auc_val,
+    accuracy = cm$overall["Accuracy"],
+    sensitivity = cm$byClass["Sensitivity"],
+    specificity = cm$byClass["Specificity"],
+    precision = cm$byClass["Pos Pred Value"],
+    cell_size = cell_size,
+    n_celdas_train = nrow(train_sf),
+    n_celdas_test = nrow(test_sf),
+    casos_positivos = sum(train_df$tiene_delito == "1"),
+    casos_negativos = sum(train_df$tiene_delito == "0"),
+    modelo = modelo,
+    train_data = train_sf,
+    test_data = test_sf,
+    test_data_con_predicciones = test_sf,  # Datos con predicciones para uso posterior
+    predicciones_prob = pred_prob,
+    predicciones_class = pred_class,
+    grafico_reales = grafico_reales,
+    grafico_probabilidades = grafico_probabilidades,
+    error = NULL
+  ))
+}
+
+```
+
+
+```{r}
+optimizar_cellsize_logistica <- function(train_data, test_data, tipo_delito, columna_delito = "tipo") {
+  
+  # Cell sizes a probar
+  cell_sizes <- c(50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000)
+  
+  # Lista para almacenar resultados
+  resultados <- list()
+  
+  # Probar cada cell_size
+  for(i in seq_along(cell_sizes)) {
+    cs <- cell_sizes[i]
+    resultado <- entrenar_evaluar_logistica(train_data, test_data, tipo_delito, columna_delito, cs)
+    resultados[[i]] <- resultado
+  }
+  
+  # Filtrar solo resultados válidos (con AUC > 0)
+  resultados_validos <- resultados[sapply(resultados, function(x) x$auc > 0)]
+  
+  # Encontrar el mejor AUC
+  aucs <- sapply(resultados_validos, function(x) x$auc)
+  mejor_idx <- which.max(aucs)
+  mejor_resultado <- resultados_validos[[mejor_idx]]
+  
+  # Crear tabla de resultados
+  tabla_resultados <- data.frame(
+    cell_size = sapply(resultados_validos, function(x) x$cell_size),
+    auc = sapply(resultados_validos, function(x) round(x$auc, 4)),
+    accuracy = sapply(resultados_validos, function(x) round(x$accuracy, 4)),
+    n_celdas_train = sapply(resultados_validos, function(x) x$n_celdas_train),
+    n_celdas_test = sapply(resultados_validos, function(x) x$n_celdas_test),
+    casos_pos = sapply(resultados_validos, function(x) x$casos_positivos),
+    casos_neg = sapply(resultados_validos, function(x) x$casos_negativos)
+  )
+  
+  # Ordenar por AUC descendente
+  tabla_resultados <- tabla_resultados[order(-tabla_resultados$auc), ]
+  
+  cat("\n=== RESULTADOS PARA", tipo_delito, "===\n")
+  print(tabla_resultados)
+  
+  cat("\n=== MEJOR MODELO ===\n")
+  cat("Cell Size Óptimo:", mejor_resultado$cell_size, "metros\n")
+  cat("AUC-ROC:", round(mejor_resultado$auc, 4), "\n")
+  cat("Accuracy:", round(mejor_resultado$accuracy, 4), "\n")
+  cat("Sensitivity:", round(mejor_resultado$sensitivity, 4), "\n")
+  cat("Specificity:", round(mejor_resultado$specificity, 4), "\n")
+  cat("Precision:", round(mejor_resultado$precision, 4), "\n")
+  cat("Celdas Train:", mejor_resultado$n_celdas_train, "\n")
+  cat("Celdas Test:", mejor_resultado$n_celdas_test, "\n")
+  
+  # Plot comparativo
+  plot(tabla_resultados$cell_size, tabla_resultados$auc, 
+       type = "b", pch = 19, col = "blue",
+       xlab = "Cell Size (metros)", ylab = "AUC-ROC",
+       main = paste("Optimización Cell Size -", tipo_delito),
+       ylim = c(min(tabla_resultados$auc) - 0.05, max(tabla_resultados$auc) + 0.05))
+  
+  # Marcar el mejor
+  points(mejor_resultado$cell_size, mejor_resultado$auc, 
+         pch = 19, col = "red", cex = 2)
+  text(mejor_resultado$cell_size, mejor_resultado$auc + 0.02, 
+       paste("Mejor:", mejor_resultado$cell_size, "m"), 
+       col = "red", font = 2)
+  
+  grid()
+  
+  return(list(
+    mejor_modelo = mejor_resultado,
+    todos_resultados = resultados_validos,
+    tabla_resultados = tabla_resultados,
+    tipo_delito = tipo_delito
+  ))
+}
+
+
+# Optimizar para HURTO
+cat("\n" %+% paste(rep("=", 60), collapse="") %+% "\n")
+optimizacion_hurto <- optimizar_cellsize_logistica(Train, Test, "Hurto", "tipo")
+
+# Optimizar para ROBO
+cat("\n" %+% paste(rep("=", 60), collapse="") %+% "\n")
+optimizacion_robo <- optimizar_cellsize_logistica(Train, Test, "Robo", "tipo")
+
+# COMPARACIÓN FINAL
+cat("HURTO - Mejor Cell Size:", optimizacion_hurto$mejor_modelo$cell_size, 
+      "m | AUC:", round(optimizacion_hurto$mejor_modelo$auc, 4), "\n")
+
+cat("ROBO  - Mejor Cell Size:", optimizacion_robo$mejor_modelo$cell_size, 
+      "m | AUC:", round(optimizacion_robo$mejor_modelo$auc, 4), "\n")
+
+if(optimizacion_hurto$mejor_modelo$auc > optimizacion_robo$mejor_modelo$auc) {
+   cat("\nMejor AUC Hurto =", round(optimizacion_hurto$mejor_modelo$auc, 4), "\n")
+} else {
+  cat("\nMejor AUC Robo =", round(optimizacion_robo$mejor_modelo$auc, 4), "\n")
+}
+```
+
+```{r}
+explorar_hiperparametros_rf <- function(train_data, test_data, tipo_delito, columna_delito = "tipo") {
+  
+  # Parámetros a probar
+  ntrees_grid <- c(50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000)
+  mtry_grid <- c(2, 3, 4, 5)
+  
+  # Preparar datos con cell_size = 50
+  train_sf <- crear_dataset_espacial_optimizado(train_data, tipo_delito, columna_delito, cell_size = 50)
+  test_sf <- crear_dataset_espacial_optimizado(test_data, tipo_delito, columna_delito, cell_size = 50)
+  
+  # Convertir a dataframe
+  train_df <- train_sf %>%
+    st_drop_geometry() %>%
+    dplyr::select(tiene_delito, x_norm, y_norm, dist_centro_norm, 
+           densidad_local_norm, cuadrante)
+  
+  test_df <- test_sf %>%
+    st_drop_geometry() %>%
+    dplyr::select(tiene_delito, x_norm, y_norm, dist_centro_norm, 
+           densidad_local_norm, cuadrante)
+  
+  # Inicializar resultados
+  resultados_grid <- data.frame(
+    ntree = integer(),
+    mtry = integer(),
+    auc = numeric(),
+    accuracy = numeric(),
+    sensitivity = numeric(),
+    specificity = numeric(),
+    precision = numeric(),
+    oob_error = numeric(),
+    tiempo_entrenamiento = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Variables para tracking del mejor modelo
+  mejor_auc <- 0
+  mejor_modelo <- NULL
+  mejor_config <- NULL
+  mejor_predicciones <- NULL
+  
+  # Total de combinaciones
+  total_combinaciones <- length(ntrees_grid) * length(mtry_grid)
+  combinacion_actual <- 0
+  
+  # Grid search
+  for(ntree in ntrees_grid) {
+    for(mtry in mtry_grid) {
+      
+      combinacion_actual <- combinacion_actual + 1
+      
+      # Medir tiempo de entrenamiento
+      tiempo_inicio <- Sys.time()
+
+# Entrenar modelo
+        modelo_rf <- randomForest(
+          tiene_delito ~ ., 
+          data = train_df,
+          ntree = ntree,
+          mtry = mtry,
+          importance = TRUE,
+          proximity = FALSE,
+          do.trace = FALSE  # Silenciar output
+        )
+        
+        tiempo_fin <- Sys.time()
+        tiempo_entrenamiento <- as.numeric(difftime(tiempo_fin, tiempo_inicio, units = "secs"))
+        
+        # Predicciones en test
+        pred_prob <- predict(modelo_rf, test_df, type = "prob")[,2]
+        pred_class <- predict(modelo_rf, test_df, type = "class")
+        
+        # Métricas de evaluación
+        cm <- confusionMatrix(pred_class, test_df$tiene_delito, positive = "1")
+        
+        # AUC-ROC
+        roc_obj <- roc(test_df$tiene_delito, pred_prob, quiet = TRUE)
+        auc_val <- auc(roc_obj)
+        
+        # OOB Error
+        oob_error <- modelo_rf$err.rate[ntree, "OOB"]
+        
+        # Guardar resultados
+        resultados_grid <- rbind(resultados_grid, data.frame(
+          ntree = ntree,
+          mtry = mtry,
+          auc = as.numeric(auc_val),
+          accuracy = as.numeric(cm$overall["Accuracy"]),
+          recall = as.numeric(cm$byClass["Recall"]),
+          precision = as.numeric(cm$byClass["Pos Pred Value"]),
+          oob_error = oob_error,
+          tiempo_entrenamiento = tiempo_entrenamiento
+        ))
+        
+        
+        # Verificar si es el mejor modelo hasta ahora
+        if(auc_val > mejor_auc) {
+          mejor_auc <- auc_val
+          mejor_modelo <- modelo_rf
+          mejor_config <- list(ntree = ntree, mtry = mtry)
+          mejor_predicciones <- list(
+            prob = pred_prob,
+            class = pred_class,
+            roc = roc_obj,
+            cm = cm
+          )
+        }
+    }
+  }
+  
+  # Ordenar resultados por AUC
+  resultados_grid <- resultados_grid[order(-resultados_grid$auc, na.last = TRUE), ]
+  
+  
+  # Información del mejor modelo
+  cat("\n=== MEJOR MODELO ENCONTRADO ===\n")
+  cat("Configuración: ntree =", mejor_config$ntree, ", mtry =", mejor_config$mtry, "\n")
+  cat("AUC-ROC:", round(mejor_auc, 4), "\n")
+  
+  
+  cat("\nMatriz de Confusión:\n")
+  cm_table <- mejor_predicciones$cm$table
+  print(cm_table)
+  cat("Accuracy: ", round(mejor_predicciones$cm$overall["Accuracy"], 4), "\n")
+  cat("Precision:", round(mejor_predicciones$cm$byClass["Pos Pred Value"], 4), "\n") 
+  cat("Recall:   ", round(mejor_predicciones$cm$byClass["Recall"], 4), "\n")
+  # Importancia de variables del mejor modelo
+  cat("\nImportancia de variables (mejor modelo):\n")
+  importancia <- importance(mejor_modelo)
+  print(round(importancia, 4))
+  
+  # ROC Curve
+  plot(mejor_predicciones$roc, 
+       main = paste("Curva ROC - Mejor RF", tipo_delito, 
+                   "\n(ntree =", mejor_config$ntree, ", mtry =", mejor_config$mtry, ")"),
+       col = "darkgreen", lwd = 2)
+  legend("bottomright", paste("AUC =", round(mejor_auc, 4)), cex = 1.2)
+  
+  # Variable Importance Plot
+  varImpPlot(mejor_modelo, 
+            main = paste("Importancia Variables - Mejor RF", tipo_delito,
+                        "\n(ntree =", mejor_config$ntree, ", mtry =", mejor_config$mtry, ")"))
+  
+  resultados_clean <- resultados_grid[!is.na(resultados_grid$auc), ]
+  
+  
+  # Preparar datos de test con predicciones para visualización espacial
+  test_sf$pred_prob <- mejor_predicciones$prob
+  test_sf$pred_class <- mejor_predicciones$class
+  
+  # Visualización espacial
+  p1 <- ggplot(test_sf) +
+    geom_sf(aes(fill = as.numeric(as.character(tiene_delito))), color = NA) +
+    geom_sf(data = calles_hs, color = "gray80", size = 0.2) +
+    scale_fill_gradient(low = "white", high = "red", name = "Delitos\nReales") +
+    ggtitle(paste("Delitos Reales -", tipo_delito, "(Cell size: 50m)")) +
+    theme_minimal()
+  
+  p2 <- ggplot(test_sf) +
+    geom_sf(aes(fill = pred_prob), color = NA) +
+    geom_sf(data = calles_hs, color = "gray80", size = 0.2) +
+    scale_fill_gradient(low = "white", high = "darkgreen", name = "Prob.\nPredicha") +
+    ggtitle(paste("Probabilidades Predichas - Mejor RF", tipo_delito,
+                  "\n(ntree =", mejor_config$ntree, ", mtry =", mejor_config$mtry, ")")) +
+    theme_minimal()
+  
+  print(p1)
+  print(p2)
+  
+  # Retornar resultados completos
+  return(list(
+    mejor_modelo = mejor_modelo,
+    mejor_config = mejor_config,
+    mejor_auc = mejor_auc,
+    mejor_predicciones = mejor_predicciones,
+    resultados_completos = resultados_grid,
+    train_data = train_sf,
+    test_data = test_sf,
+    importancia = importancia
+  ))
+}
+
+
+resultado_grid_hurto <- explorar_hiperparametros_rf(Train, Test, "Hurto", columna_delito = "tipo")
+
+resultado_grid_robo <- explorar_hiperparametros_rf(Train, Test, "Robo", columna_delito = "tipo")
+
+# Resumen final comparativo
+cat("\n=== RESUMEN FINAL DE MEJORES MODELOS ===\n")
+cat("TIPO DELITO\t\tMEJOR CONFIG\t\t\tAUC\n")
+cat("-------------------------------------------------------\n")
+
+cat("HURTO\t\t\tntree =", resultado_grid_hurto$mejor_config$ntree,
+    ", mtry =", resultado_grid_hurto$mejor_config$mtry, 
+    "\t\t", round(resultado_grid_hurto$mejor_auc, 4), "\n")
+  
+cat("ROBO\t\t\tntree =", resultado_grid_robo$mejor_config$ntree, 
+      ", mtry =", resultado_grid_robo$mejor_config$mtry, 
+      "\t\t", round(resultado_grid_robo$mejor_auc, 4), "\n")
+```
+
+```{r}
+
+explorar_hiperparametros_xgb <- function(train_data, test_data, tipo_delito, columna_delito = NULL) {
+
+  
+  # Parámetros a probar
+  nrounds_grid <- seq(50, 100, by = 10)  # 50, 60, 70, 80, 90, 100
+  eta_grid <- c(0.1, 0.2, 0.3)
+  max_depth_fijo <- 6  
+  
+  # Preparar datos con cell_size = 50
+  train_sf <- crear_dataset_espacial_optimizado(train_data, tipo_delito, columna_delito, cell_size = 50)
+  test_sf <- crear_dataset_espacial_optimizado(test_data, tipo_delito, columna_delito, cell_size = 50)
+  
+  # Convertir a dataframe
+  train_df <- train_sf %>%
+    st_drop_geometry() %>%
+    dplyr::select(tiene_delito, x_norm, y_norm, dist_centro_norm, 
+           densidad_local_norm, cuadrante)
+  
+  test_df <- test_sf %>%
+    st_drop_geometry() %>%
+    dplyr::select(tiene_delito, x_norm, y_norm, dist_centro_norm, 
+           densidad_local_norm, cuadrante)
+  
+  
+ 
+  
+  # Preparar matrices para XGBoost
+  
+  train_matrix <- model.matrix(tiene_delito ~ . - 1, data = train_df)
+  test_matrix <- model.matrix(tiene_delito ~ . - 1, data = test_df)
+  
+  # Convertir target a numérico (0/1)
+  train_label <- as.numeric(train_df$tiene_delito) - 1
+  test_label <- as.numeric(test_df$tiene_delito) - 1
+  
+  # Crear DMatrix para XGBoost
+  dtrain <- xgb.DMatrix(data = train_matrix, label = train_label)
+  dtest <- xgb.DMatrix(data = test_matrix, label = test_label)
+  
+  # Inicializar resultados
+  resultados_grid <- data.frame(
+    nrounds = integer(),
+    eta = numeric(),
+    max_depth = integer(),
+    auc = numeric(),
+    accuracy = numeric(),
+    sensitivity = numeric(),
+    specificity = numeric(),
+    precision = numeric(),
+    train_auc = numeric(),
+    test_auc = numeric(),
+    tiempo_entrenamiento = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Variables para tracking del mejor modelo
+  mejor_auc <- 0
+  mejor_modelo <- NULL
+  mejor_config <- NULL
+  mejor_predicciones <- NULL
+  mejor_matrices <- NULL
+  
+  # Total de combinaciones
+  total_combinaciones <- length(nrounds_grid) * length(eta_grid)
+  combinacion_actual <- 0
+
+  
+  # Grid search
+  for(nrounds in nrounds_grid) {
+    for(eta in eta_grid) {
+      
+      combinacion_actual <- combinacion_actual + 1
+    
+      
+      # Medir tiempo de entrenamiento
+      tiempo_inicio <- Sys.time()
+      # Parámetros del modelo
+        params <- list(
+          objective = "binary:logistic",
+          eval_metric = "auc",
+          max_depth = max_depth_fijo,
+          eta = eta,
+          subsample = 0.8,
+          colsample_bytree = 0.8,
+          verbosity = 0  # Silenciar output
+        )
+        
+        # Entrenar modelo
+        modelo_xgb <- xgb.train(
+          params = params,
+          data = dtrain,
+          nrounds = nrounds,
+          watchlist = list(train = dtrain, test = dtest),
+          verbose = 0,  # Silenciar output
+          early_stopping_rounds = 10,
+          print_every_n = 0  # No imprimir progreso
+        )
+        
+        tiempo_fin <- Sys.time()
+        tiempo_entrenamiento <- as.numeric(difftime(tiempo_fin, tiempo_inicio, units = "secs"))
+        
+        # Predicciones en test
+        pred_prob <- predict(modelo_xgb, dtest)
+        pred_class <- factor(ifelse(pred_prob > 0.5, "1", "0"), levels = c("0", "1"))
+        
+        # Métricas de evaluación
+        cm <- confusionMatrix(pred_class, test_df$tiene_delito, positive = "1")
+        
+        # AUC-ROC
+        roc_obj <- roc(test_df$tiene_delito, pred_prob, quiet = TRUE)
+        auc_val <- auc(roc_obj)
+        
+        # AUC en train (para verificar overfitting)
+        pred_prob_train <- predict(modelo_xgb, dtrain)
+        roc_train <- roc(train_df$tiene_delito, pred_prob_train, quiet = TRUE)
+        auc_train <- auc(roc_train)
+        
+        # Guardar resultados
+        resultados_grid <- rbind(resultados_grid, data.frame(
+          nrounds = nrounds,
+          eta = eta,
+          max_depth = max_depth_fijo,
+          auc = as.numeric(auc_val),
+          accuracy = as.numeric(cm$overall["Accuracy"]),
+          sensitivity = as.numeric(cm$byClass["Sensitivity"]),
+          specificity = as.numeric(cm$byClass["Specificity"]),
+          precision = as.numeric(cm$byClass["Pos Pred Value"]),
+          train_auc = as.numeric(auc_train),
+          test_auc = as.numeric(auc_val),
+          tiempo_entrenamiento = tiempo_entrenamiento
+        ))
+        
+       
+        
+        # Verificar si es el mejor modelo hasta ahora
+        if(auc_val > mejor_auc) {
+          mejor_auc <- auc_val
+          mejor_modelo <- modelo_xgb
+          mejor_config <- list(nrounds = nrounds, eta = eta, max_depth = max_depth_fijo)
+          mejor_predicciones <- list(
+            prob = pred_prob,
+            class = pred_class,
+            roc = roc_obj,
+            cm = cm
+          )
+          mejor_matrices <- list(
+            train_matrix = train_matrix,
+            test_matrix = test_matrix
+          )
+         
+        }
+       
+    }
+  }
+  
+  
+  # Ordenar resultados por AUC
+  resultados_grid <- resultados_grid[order(-resultados_grid$auc, na.last = TRUE), ]
+  
+  
+  # Información del mejor modelo
+  cat("\n=== MEJOR MODELO ENCONTRADO ===\n")
+  cat("Configuración: nrounds =", mejor_config$nrounds, 
+      ", eta =", mejor_config$eta, 
+      ", max_depth =", mejor_config$max_depth, "\n")
+  cat("AUC-ROC:", round(mejor_auc, 4), "\n")
+  
+  # Métricas detalladas del mejor modelo
+  
+  cat("\nMatriz de Confusión:\n")
+  cm_table <- mejor_predicciones$cm$table
+  print(cm_table)
+  cat("Accuracy: ", round(mejor_predicciones$cm$overall["Accuracy"], 4), "\n")
+  cat("Precision:", round(mejor_predicciones$cm$byClass["Pos Pred Value"], 4), "\n") 
+  cat("Recall:   ", round(mejor_predicciones$cm$byClass["Recall"], 4), "\n")
+  
+  # Importancia de variables del mejor modelo
+  importancia <- xgb.importance(colnames(mejor_matrices$train_matrix), model = mejor_modelo)
+  
+  # Visualizaciones del mejor modelo
+  # ROC Curve
+  plot(mejor_predicciones$roc, 
+       main = paste("Curva ROC - Mejor XGBoost", tipo_delito, 
+                   "\n(nrounds =", mejor_config$nrounds, 
+                   ", eta =", mejor_config$eta, ")"),
+       col = "purple", lwd = 2)
+  legend("bottomright", paste("AUC =", round(mejor_auc, 4)), cex = 1.2)
+  
+  # Variable Importance Plot
+  xgb.plot.importance(importancia, 
+                     main = paste("Importancia Variables - Mejor XGBoost", tipo_delito,
+                                 "\n(nrounds =", mejor_config$nrounds, 
+                                 ", eta =", mejor_config$eta, ")"))
+  
+  
+  # Preparar datos de test con predicciones para visualización espacial
+  test_sf$pred_prob <- mejor_predicciones$prob
+  test_sf$pred_class <- mejor_predicciones$class
+  
+  # Visualización espacial
+  p1 <- ggplot(test_sf) +
+    
+    geom_sf(aes(fill = as.numeric(as.character(tiene_delito))), color = NA) +
+    geom_sf(data = calles_hs, color = "gray80", size = 0.2) +
+    scale_fill_gradient(low = "white", high = "red", name = "Delitos\nReales") +
+    ggtitle(paste("Delitos Reales -", tipo_delito, "(Cell size: 50m)")) +
+    theme_minimal()
+  
+  p2 <- ggplot(test_sf) +
+    geom_sf(aes(fill = pred_prob), color = NA) +
+    geom_sf(data = calles_hs, color = "gray80", size = 0.2) +
+    scale_fill_gradient(low = "white", high = "purple", name = "Prob.\nPredicha") +
+    ggtitle(paste("Probabilidades Predichas - Mejor XGBoost", tipo_delito,
+                  "\n(nrounds =", mejor_config$nrounds, 
+                  ", eta =", mejor_config$eta, ")")) +
+  
+    theme_minimal()
+  
+  print(p1)
+  print(p2)
+  
+  # Retornar resultados completos
+  return(list(
+    mejor_modelo = mejor_modelo,
+    mejor_config = mejor_config,
+    mejor_auc = mejor_auc,
+    mejor_predicciones = mejor_predicciones,
+    mejor_matrices = mejor_matrices,
+    resultados_completos = resultados_grid,
+    train_data = train_sf,
+    test_data = test_sf,
+    importancia = importancia
+  ))
+}
+
+
+resultado_xgb_grid_hurto <- explorar_hiperparametros_xgb(Train, Test, "Hurto", columna_delito = "tipo")
+resultado_xgb_grid_robo <- explorar_hiperparametros_xgb(Train, Test, "Robo", columna_delito = "tipo")
+
+# Resumen final comparativo
+cat("\n=== RESUMEN FINAL DE MEJORES MODELOS XGBOOST ===\n")
+cat("TIPO DELITO\t\tMEJOR CONFIG\t\t\t\tAUC\n")
+cat("-------------------------------------------------------------------\n")
+
+cat("HURTO\t\t\tnrounds =", resultado_xgb_grid_hurto$mejor_config$nrounds, 
+    ", eta =", resultado_xgb_grid_hurto$mejor_config$eta, 
+    "\t\t", round(resultado_xgb_grid_hurto$mejor_auc, 4), "\n")
+
+
+
+cat("ROBO\t\t\tnrounds =", resultado_xgb_grid_robo$mejor_config$nrounds, 
+    ", eta =", resultado_xgb_grid_robo$mejor_config$eta, 
+    "\t\t", round(resultado_xgb_grid_robo$mejor_auc, 4), "\n")
+
+```
+
+Validemos para ver cuál es la mejor configuración para cada modelo. Para ello entrenaremos con Pretrain y validaremos con Validation. El split en Train-Test fue para la exploración de hiperparámetros y evitar data leakage.
+
+```{r}
+entrenar_evaluar_randomforest <- function(train_data, test_data, tipo_delito, columna_delito, cell_size, ntree, mtry) {
+  
+  # Crear datasets
+  train_sf <- crear_dataset_espacial_optimizado(train_data, tipo_delito, columna_delito, cell_size)
+  test_sf <- crear_dataset_espacial_optimizado(test_data, tipo_delito, columna_delito, cell_size)
+  
+  # Convertir a dataframe
+  train_df <- train_sf %>%
+    st_drop_geometry() %>%
+    dplyr::select(tiene_delito, x_norm, y_norm, dist_centro_norm, 
+                  densidad_local_norm, cuadrante)
+  
+  test_df <- test_sf %>%
+    st_drop_geometry() %>%
+    dplyr::select(tiene_delito, x_norm, y_norm, dist_centro_norm, 
+                  densidad_local_norm, cuadrante)
+  
+  # Entrenar modelo Random Forest
+  modelo_rf <- randomForest(
+    tiene_delito ~ x_norm + y_norm + dist_centro_norm + densidad_local_norm + cuadrante,
+    data = train_df,
+    ntree = ntree,           
+    mtry = mtry,              
+    importance = TRUE,     
+    do.trace = FALSE       
+  )
+  
+  # Predicciones (probabilidades)
+  pred_prob <- predict(modelo_rf, test_df, type = "prob")[, "1"]
+  
+  # Calcular AUC
+  roc_obj <- roc(test_df$tiene_delito, pred_prob, quiet = TRUE)
+  auc_val <- as.numeric(auc(roc_obj))
+  
+  # Métricas adicionales
+  pred_class <- factor(ifelse(pred_prob > 0.5, "1", "0"), levels = c("0", "1"))
+  cm <- confusionMatrix(pred_class, test_df$tiene_delito, positive = "1")
+  
+  # Importancia de variables
+  importancia <- importance(modelo_rf)
+  importancia_df <- data.frame(
+    Variable = rownames(importancia),
+    MeanDecreaseAccuracy = importancia[, "MeanDecreaseAccuracy"],
+    MeanDecreaseGini = importancia[, "MeanDecreaseGini"]
+  )
+  p1 <- ggplot(test_sf) +
+    geom_sf(aes(fill = as.numeric(as.character(tiene_delito))), color = NA) +
+    geom_sf(data = calles_hs, color = "gray80", size = 0.2) +
+    scale_fill_gradient(low = "white", high = "red", name = "Delitos\nReales") +
+    ggtitle(paste("Delitos Reales -", tipo_delito, "(Cell size: 50m)")) +
+        theme_minimal() +
+    theme(
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+      legend.position = "right",
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+    )
+
+  
+  
+  p2 <- ggplot(test_sf) +
+  geom_sf(aes(fill = pred_prob), color = NA) +
+  geom_sf(data = calles_hs, color = "gray80", size = 0.2) +
+  scale_fill_gradient(low = "white", high = "darkgreen", name = "Prob.\nPredicha") +
+  ggtitle(paste("Probabilidades Predichas - Mejor RF", tipo_delito,
+                "\n(ntree =", modelo_rf$ntree, ", mtry =", modelo_rf$mtry, ")"))+
+        theme_minimal() +
+    theme(
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+      legend.position = "right",
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+    )
+
+  
+  
+  return(list(
+    auc = auc_val,
+    accuracy = cm$overall["Accuracy"],
+    sensitivity = cm$byClass["Sensitivity"],
+    specificity = cm$byClass["Specificity"],
+    precision = cm$byClass["Pos Pred Value"],
+    cell_size = cell_size,
+    n_celdas_train = nrow(train_sf),
+    n_celdas_test = nrow(test_sf),
+    casos_positivos = sum(train_df$tiene_delito == "1"),
+    casos_negativos = sum(train_df$tiene_delito == "0"),
+    modelo = modelo_rf,
+    train_data = train_sf,
+    test_data = test_sf,
+    importancia = importancia_df,
+    oob_error = modelo_rf$err.rate[modelo_rf$ntree, "OOB"],
+    error = NULL,
+    grafico_reales = p1,
+    grafico_probabilidades = p2
+  ))
+}
+
+
+```
+
+```{r}
+entrenar_evaluar_xgboost <- function(train_data, test_data, tipo_delito, columna_delito, cell_size, nrounds, eta, max_depth) {
+  
+  # Crear datasets
+  train_sf <- crear_dataset_espacial_optimizado(train_data, tipo_delito, columna_delito, cell_size)
+  test_sf <- crear_dataset_espacial_optimizado(test_data, tipo_delito, columna_delito, cell_size)
+  
+  # Convertir a dataframe
+  train_df <- train_sf %>%
+    st_drop_geometry() %>%
+    dplyr::select(tiene_delito, x_norm, y_norm, dist_centro_norm, 
+                  densidad_local_norm, cuadrante)
+  
+  test_df <- test_sf %>%
+    st_drop_geometry() %>%
+    dplyr::select(tiene_delito, x_norm, y_norm, dist_centro_norm, 
+                  densidad_local_norm, cuadrante)
+  
+  # Preparar datos para XGBoost
+  train_matrix <- model.matrix(tiene_delito ~ . - 1, data = train_df)
+  test_matrix <- model.matrix(tiene_delito ~ . - 1, data = test_df)
+  
+  # Labels (0 y 1)
+  train_labels <- as.numeric(as.character(train_df$tiene_delito))
+  test_labels <- as.numeric(as.character(test_df$tiene_delito))
+  
+  # Crear matrices DMatrix para XGBoost
+  dtrain <- xgb.DMatrix(data = train_matrix, label = train_labels)
+  dtest <- xgb.DMatrix(data = test_matrix, label = test_labels)
+  
+  # Parámetros para XGBoost
+  params <- list(
+          objective = "binary:logistic",
+          eval_metric = "auc",
+          max_depth = max_depth,
+          eta = eta,
+          subsample = 0.8,
+          colsample_bytree = 0.8,
+          verbosity = 0  # Silenciar output
+        )
+  
+  modelo_xgb <- xgb.train(
+    params = params,
+          data = dtrain,
+          nrounds = nrounds,
+          watchlist = list(train = dtrain, test = dtest),
+          verbose = 0,  # Silenciar output
+          early_stopping_rounds = 10,
+          print_every_n = 0  # No imprimir progreso
+  )
+  
+  # Predicciones (probabilidades)
+  pred_prob <- predict(modelo_xgb, dtest)
+  
+  # Calcular AUC
+  roc_obj <- roc(test_df$tiene_delito, pred_prob, quiet = TRUE)
+  auc_val <- as.numeric(auc(roc_obj))
+  
+  # Métricas adicionales
+  pred_class <- factor(ifelse(pred_prob > 0.5, "1", "0"), levels = c("0", "1"))
+  cm <- confusionMatrix(pred_class, test_df$tiene_delito, positive = "1")
+  
+  # Importancia de variables
+  importancia <- xgb.importance(model = modelo_xgb)
+  
+  p1 <- ggplot(test_sf) +
+    geom_sf(aes(fill = as.numeric(as.character(tiene_delito))), color = NA) +
+    geom_sf(data = calles_hs, color = "gray80", size = 0.2) +
+    scale_fill_gradient(low = "white", high = "red", name = "Delitos\nReales") +
+    ggtitle(paste("Delitos Reales -", tipo_delito, "(Cell size: 50m)")) +
+    theme_minimal()+
+    theme(
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+      legend.position = "right",
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+    )
+  
+  p2 <- ggplot(test_sf) +
+    geom_sf(aes(fill = pred_prob), color = NA) +
+    geom_sf(data = calles_hs, color = "gray80", size = 0.2) +
+    scale_fill_gradient(low = "white", high = "purple", name = "Prob.\nPredicha") +
+    ggtitle(paste("Probabilidades Predichas - Mejor XGBoost", tipo_delito,
+                  "\n(nrounds =", modelo_xgb$nrounds, 
+                  ", eta =", modelo_xgb$eta, ")")) +
+  
+    theme_minimal() +
+    theme(
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+      legend.position = "right",
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+    )
+  
+  
+  return(list(
+    auc = auc_val,
+    accuracy = cm$overall["Accuracy"],
+    sensitivity = cm$byClass["Sensitivity"],
+    specificity = cm$byClass["Specificity"],
+    precision = cm$byClass["Pos Pred Value"],
+    cell_size = cell_size,
+    n_celdas_train = nrow(train_sf),
+    n_celdas_test = nrow(test_sf),
+    casos_positivos = sum(train_df$tiene_delito == "1"),
+    casos_negativos = sum(train_df$tiene_delito == "0"),
+    modelo = modelo_xgb,
+    train_data = train_sf,
+    test_data = test_sf,
+    importancia = importancia,
+    nrounds = nrounds,
+    error = NULL,
+    grafico_reales = p1,
+    grafico_probabilidades = p2
+  ))
+}
+```
+
+```{r}
+regLog_final_H = entrenar_evaluar_logistica(preTrain, Validation, "Hurto", "tipo", 50)
+regLog_final_R = entrenar_evaluar_logistica(preTrain, Validation, "Robo", "tipo", 50)
+```
+
+
+```{r}
+RF_final_H = entrenar_evaluar_randomforest(preTrain, Validation, "Hurto", "tipo", 50, 50, 2)
+RF_final_R = entrenar_evaluar_randomforest(preTrain, Validation, "Robo", "tipo", 50, 50, 2)
+```
+
+```{r}
+XG_final_H = entrenar_evaluar_xgboost(preTrain, Validation, "Hurto", "tipo", 50, 50, 0.1,6)
+XG_final_R = entrenar_evaluar_xgboost(preTrain, Validation, "Robo", "tipo", 50, 50, 0.1,6)
+```
+
+
+```{r}
+
+# Función para crear tabla comparativa de modelos
+crear_tabla_comparativa <- function(resultado_logistico, resultado_rf, resultado_xgboost) {
+  
+  # Extraer métricas principales de cada modelo
+  metricas <- data.frame(
+    Metrica = c("AUC", "Accuracy", "Sensitivity", "Specificity", "Precision",
+                "Celdas Train", "Celdas Test", "Casos Positivos", "Casos Negativos"),
+    
+    Regresion_Logistica = c(
+      round(resultado_logistico$auc, 7),
+      round(resultado_logistico$accuracy, 7),
+      round(resultado_logistico$sensitivity, 7),
+      round(resultado_logistico$specificity, 7),
+      round(resultado_logistico$precision, 7),
+      resultado_logistico$n_celdas_train,
+      resultado_logistico$n_celdas_test,
+      resultado_logistico$casos_positivos,
+      resultado_logistico$casos_negativos
+    ),
+    
+    Random_Forest = c(
+      round(resultado_rf$auc, 7),
+      round(resultado_rf$accuracy, 7),
+      round(resultado_rf$sensitivity, 7),
+      round(resultado_rf$specificity, 7),
+      round(resultado_rf$precision, 7),
+      resultado_rf$n_celdas_train,
+      resultado_rf$n_celdas_test,
+      resultado_rf$casos_positivos,
+      resultado_rf$casos_negativos
+    ),
+    
+    XGBoost = c(
+      round(resultado_xgboost$auc, 7),
+      round(resultado_xgboost$accuracy, 7),
+      round(resultado_xgboost$sensitivity, 7),
+      round(resultado_xgboost$specificity, 7),
+      round(resultado_xgboost$precision, 7),
+      resultado_xgboost$n_celdas_train,
+      resultado_xgboost$n_celdas_test,
+      resultado_xgboost$casos_positivos,
+      resultado_xgboost$casos_negativos
+    )
+  )
+  
+  return(metricas)
+}
+
+```
+
+
+Veamos cual fue el mejor modelo para hurto.
+
+```{r}
+crear_tabla_comparativa(regLog_final_H,RF_final_H,XG_final_H)
+```
+
+Veamos las predicciones en términos de sus gráficos
+
+```{r}
+grid.arrange(regLog_final_H$grafico_reales, regLog_final_H$grafico_probabilidades, ncol = 2)
+
+```
+
+```{r}
+grid.arrange(RF_final_H$grafico_reales, RF_final_H$grafico_probabilidades, ncol = 2)
+```
+
+```{r}
+grid.arrange(XG_final_H$grafico_reales, XG_final_H$grafico_probabilidades, ncol = 2)
+```
+
+
+```{r}
+install.packages("cowplot")
+```
+
+
+
+Veamos cual fue el mejor modelo para robo.
+
+```{r}
+crear_tabla_comparativa(regLog_final_R,RF_final_R,XG_final_R)
+```
+
+
+```{r}
+grid.arrange(regLog_final_R$grafico_reales, regLog_final_R$grafico_probabilidades, ncol = 2)
+
+```
+
+```{r}
+grid.arrange(RF_final_R$grafico_reales, RF_final_R$grafico_probabilidades, ncol = 2)
+```
+
+```{r}
+grid.arrange(XG_final_R$grafico_reales, XG_final_R$grafico_probabilidades, ncol = 2)
+```
+
+Trabajo futuro: como Palermo es el barrio más peligroso de CABA encontramos que solo utilizando información espacial podíamos obtener buenos resultados para los modelos. De todos modos, no aprovechamos otras variables como franja o mes. Esto último recae en que deberíamos separar el análisis de acuerdo a las 24 franjas horarias del día o los 12 meses del año y queríamos hacer algo más simple. No obstante, si fueramos un ente estatal esto podría automatizarse con un workflow y/o AI agents y hacerse de forma dinámica y aportar información valiosa. A su vez, se podría expandir el análisis a los demás barrios de CABA pero en estos quizás haya que tener en cuenta más información dado que algunos no presentaban tantos delitos. Por último, también podría realizarse un análisis donde se tenga en cuenta los barrios colindantes y ver si hay alguna correlación entre los robos en Palermo y los barrios adyacentes.
+
+
+
