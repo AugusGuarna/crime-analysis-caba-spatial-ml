@@ -42,4 +42,3 @@ We implemented a comparative framework to determine the most accurate model for 
 ## 📂 Repository Structure
 * `data/`: datasets.
 * `scripts/`: R scripts for EDA, Spatial Engineering, and Modeling.
-* `output/`: figures.
