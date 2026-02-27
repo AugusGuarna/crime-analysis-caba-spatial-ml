@@ -1,8 +1,6 @@
 ---
 title: "TP Final"
-output:
-  html_document: default
-  pdf_document: default
+output: html_document
 date: "2025-07-18"
 ---
 
@@ -33,9 +31,9 @@ datos2022$franja <- as.numeric(datos2022$franja)
 datos2023$franja <- as.numeric(datos2023$franja)
 datos2024$franja <- as.numeric(datos2024$franja)
 
-datos2022 <- datos2022 %>% select(-id.mapa)
-datos2023 <- datos2023 %>% select(-"id-mapa")
-datos2024 <- datos2024 %>% select(-id.mapa)
+datos2022 <- datos2022 %>% dplyr::select(-id.mapa)
+datos2023 <- datos2023 %>% dplyr::select(-"id-mapa")
+datos2024 <- datos2024 %>% dplyr::select(-id.mapa)
 ```
 Juntamos todos
 
@@ -248,6 +246,8 @@ Vemos que aquellos delitos donde se usa moto o arma representan una menor propor
 ```{r}
 delitos.sf <- delitos.sf %>% select(-uso_moto)
 delitos.sf <- delitos.sf %>% select(-uso_arma)
+delitos <- delitos %>% select(-uso_moto)
+delitos <- delitos %>% select(-uso_arma)
 ```
 
 Grafiquemos para un mismo año un mapa que contenga los dos tipos de delitos.
@@ -473,7 +473,7 @@ ggplot(delitos_anio, aes(x = mes)) +
     axis.text.y = element_text(size = 6)   
   )
 ```
-No hay una tendencia clara en los robos por mes.
+No hay una tendencia clara en los robos por mes. Sin embargo, mantendremos estas dos variables porque, quizás, al mirarlas en conjunto, podrían brindarnos información relevante.
 
 Fijemonos si hay un hotspot espacial.
 ```{r}
@@ -540,6 +540,7 @@ library(pROC)
 library(randomForest)
 library(xgboost)
 library(gridExtra)
+library(spatstat)
 ```
 
 
@@ -596,6 +597,7 @@ Vemos que los hotspots fueron variando a lo largo de los años pero que de 2022 
 
 Nosotros ahora armaremos diferentes modelos y para ello entrenaremos con todo el 2023 y luego predeciremos los valores de 2024. A la hora de hacer modelos con datos temporales es muy importante no mezclar la fecha de los sucesos.
 
+Lo primero que hacemos es transformar el problema en uno de clasificación binaria.Las instancias positivas serán los robos y las instancias negativas serán los hurtos
 
 ```{r}
 delitos_filtrado <- delitos.sf %>% 
@@ -608,6 +610,8 @@ meses_ordenados <- c("ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO",
 delitos_filtrado <- delitos_filtrado %>%
   mutate(mes_num = match(mes, meses_ordenados))
 
+delitos_filtrado <- delitos_filtrado %>%
+  mutate(res = ifelse(tipo=="Hurto", 0, 1))
 
 preTrain <- delitos_filtrado %>%
   filter(anio == 2023 | (anio == 2024 & mes_num <= 9))
@@ -616,1090 +620,1478 @@ Train <- preTrain  %>%
   filter(anio == 2023 | (anio == 2024 & mes_num <= 6))
 
 Test <- preTrain %>%
-  filter(anio == 2023 | (anio == 2024 & mes_num <= 9 & mes_num > 6 ))
+  filter(anio == 2024 & mes_num <= 9 & mes_num > 6 )
 
 Validation <- delitos_filtrado %>%
   filter(anio == 2024 & mes_num >= 10)
 
 ```
 
+Para hacer el análisis del riesgo relativo, filtramos el dataset de la misma forma, pues luego vamos a querer compararlo con los modelos que entrenemos.
+```{r}
+barrios_caba <- st_read("http://cdn.buenosaires.gob.ar/datosabiertos/datasets/barrios/barrios.geojson") %>%
+  filter(BARRIO == "PALERMO")
+
+palermo_sf <- barrios_caba$geometry[1]
+```
+```{r}
+library(spatstat)
+```
+
+```{r}
+dataset_juguete <- delitos_filtrado %>% filter(res==1)
+primeras_n_filas <- delitos_filtrado %>% filter(res==0) %>% slice_head(n=100)
+dataset_juguete <- bind_rows(dataset_juguete, primeras_n_filas)
+```
+
+
+```{r}
+# Reproyectar al CRS plano
+delitos_proj <- st_transform(delitos_filtrado, 32721)
+palermo_proj <- st_transform(palermo_sf, 32721)
+#delitos_proj <- st_transform(dataset_juguete, 32721)
+
+# Filtrar solo puntos dentro del polígono
+inside_idx <- st_within(delitos_proj, palermo_proj, sparse = FALSE)[,1]
+delitos_dentro <- delitos_proj[inside_idx, ]
+
+# Crear ventana
+win <- as.owin(palermo_proj)
+
+# --- CREAR PPP solo con geometry + res ---
+# extraer coords
+coords <- st_coordinates(delitos_dentro)
+
+# construir ppp
+X <- ppp(
+  x = coords[,1],
+  y = coords[,2],
+  window = win,
+  marks = factor(delitos_dentro$res, labels = c("NoDelito","Delito"))
+)
+
+# Riesgo relativo
+rr  <- relrisk(X, relative = TRUE)
+rrF <- relrisk(X, relative = FALSE)
+plot(rr, main = "Riesgo Relativo en Palermo")
+points(X, pch=20, cex=0.4)
+
+```
+
+```{r}
+#DS Juguete
+plot(rr, main = "Riesgo Relativo en Palermo")
+plot(rrF, main = "Riesgo Relativo en Palermo")
+```
+
+
+```{r}
+plot(rr, main = "Riesgo Relativo en Palermo") #DS Completo
+plot(rrF, main = "Riesgo Relativo en Palermo")
+```
+
+
 Entrenaremos 3 modelos muy utilizados para clasificación binaria: regresión logística, Random Forest y XGBoost.
 
+
+
+Primero, vamos a fitear 3 modelos dejando que solo utilicen latitud y longitud como variables explicativas.
 ```{r}
-crear_dataset_espacial_optimizado <- function(delitos_sf, tipo_delito, columna_delito, cell_size) {
+delitos_filtrado_solo_lat_long <- delitos %>% 
+  filter(anio != 2022)
 
-  # Filtrar por tipo de delito
-  delitos_tipo <- delitos_sf %>%
-    filter(grepl(tipo_delito, .data[[columna_delito]], ignore.case = TRUE))
+meses_ordenados <- c("ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO",
+                     "JULIO", "AGOSTO", "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE")
 
-  # Transformar CRS si es necesario
-  if(st_is_longlat(delitos_tipo) || st_crs(delitos_tipo)$epsg == 4326) {
-    delitos_tipo <- st_transform(delitos_tipo, crs = 5347)
-  }
+delitos_filtrado_solo_lat_long <- delitos_filtrado_solo_lat_long %>%
+  mutate(mes_num = match(mes, meses_ordenados))
 
-  # Crear grilla
-  grid <- st_make_grid(delitos_tipo, cellsize = cell_size, square = TRUE)
-  grid_sf <- st_sf(grid_id = 1:length(grid), geometry = grid)
+delitos_filtrado_solo_lat_long$tipo <- ifelse(delitos_filtrado_solo_lat_long$tipo == "Hurto", 1, 0)
 
-  # Contar delitos por celda
-  delitos_por_celda <- suppressWarnings(st_intersects(grid_sf, delitos_tipo))
-  grid_sf$delitos_count <- lengths(delitos_por_celda)
+delitos_filtrado_solo_lat_long <- delitos_filtrado_solo_lat_long %>%
+  mutate(res = ifelse(tipo=="Hurto", 0, 1))
 
-  # Variable target binaria
-  grid_sf$tiene_delito <- as.factor(ifelse(grid_sf$delitos_count > 0, 1, 0))
 
-  # Verificar que tenemos ambas clases
-  casos_positivos <- sum(grid_sf$tiene_delito == "1")
-  casos_negativos <- sum(grid_sf$tiene_delito == "0")
 
-  # Extraer coordenadas del centroide
-  centroides <- suppressWarnings(st_centroid(grid_sf))
-  coords <- st_coordinates(centroides)
-  grid_sf$x <- coords[,1]
-  grid_sf$y <- coords[,2]
+preTrain <- delitos_filtrado_solo_lat_long %>%
+  filter(anio == 2023 | (anio == 2024 & mes_num <= 9))
 
-  # Features espaciales
-  grid_sf <- grid_sf %>%
-    mutate(
-      # Coordenadas normalizadas
-      x_norm = scale(x)[,1],
-      y_norm = scale(y)[,1],
+Train <- preTrain  %>%
+  filter(anio == 2023 | (anio == 2024 & mes_num <= 6))
 
-      # Distancia al centro
-      dist_centro = sqrt((x - mean(x))^2 + (y - mean(y))^2),
-      dist_centro_norm = scale(dist_centro)[,1],
+Test <- preTrain %>%
+  filter(anio == 2024 & mes_num <= 9 & mes_num > 6 )
 
-      # Cuadrantes
-      cuadrante = case_when(
-        x >= mean(x) & y >= mean(y) ~ "NE",
-        x < mean(x) & y >= mean(y) ~ "NW",
-        x < mean(x) & y < mean(y) ~ "SW",
-        TRUE ~ "SE"
-      ),
+Validation <- delitos_filtrado_solo_lat_long %>%
+  filter(anio == 2024 & mes_num >= 10)
 
-      # Densidad local simplificada
-      densidad_local = delitos_count
-    )
-
-  # Densidad local normalizada
-  grid_sf$densidad_local_norm <- scale(grid_sf$densidad_local)[,1]
-
-  return(grid_sf)
-}
 
 ```
 
 ```{r}
-entrenar_evaluar_logistica <- function(train_data, test_data, tipo_delito, columna_delito, cell_size) {
+Train$latitud <- as.numeric(Train$latitud)
+Train$longitud <- as.numeric(Train$longitud)
+
+Test$latitud <- as.numeric(Test$latitud)
+Test$longitud <- as.numeric(Test$longitud)
+
+Validation$latitud <- as.numeric(Validation$latitud)
+Validation$longitud <- as.numeric(Validation$longitud)
+
+preTrain$latitud <- as.numeric(preTrain$latitud)
+preTrain$longitud <- as.numeric(preTrain$longitud)
+
+
+```
+
+```{r}
+install.packages("pROC")
+```
+Definimos ciertas funciones que van a ayudar e importamos librerías.
+
+```{r}
+library(pROC)
+library(sf)
+library(ggplot2)
+library(dplyr)
+library(gridExtra)
+library(randomForest)
+library(xgboost)
+
+
+calcular_metricas <- function(real, predicho, probabilidades, nombre_conjunto) {
+  tabla <- table(Observado = real, Predicho = predicho)
   
-  # Crear datasets
-  train_sf <- crear_dataset_espacial_optimizado(train_data, tipo_delito, columna_delito, cell_size)
-  test_sf <- crear_dataset_espacial_optimizado(test_data, tipo_delito, columna_delito, cell_size)
+  accuracy <- sum(diag(tabla)) / sum(tabla)
+  precision <- ifelse(sum(tabla[,2]) > 0, tabla[2,2] / sum(tabla[,2]), 0)
+  recall <- ifelse(sum(tabla[2,]) > 0, tabla[2,2] / sum(tabla[2,]), 0)
+  f1 <- ifelse((precision + recall) > 0, 2 * precision * recall / (precision + recall), 0)
+  roc_obj <- roc(real, probabilidades, quiet = TRUE)
+  auc_value <- auc(roc_obj)
+  plot(roc_obj, 
+     main = paste("Curva ROC en", nombre_conjunto) , 
+     col = "blue", 
+     lwd = 2,
+     print.auc = TRUE)
   
-  # Convertir a dataframe
-  train_df <- train_sf %>%
-    st_drop_geometry() %>%
-    dplyr::select(tiene_delito, x_norm, y_norm, dist_centro_norm, 
-           densidad_local_norm, cuadrante)
+  cat("=== MÉTRICAS -", nombre_conjunto, "===\n")
+  print(tabla)
+  cat("Accuracy:", round(accuracy, 3), "\n")
+  cat("Precision:", round(precision, 3), "\n")
+  cat("Recall:", round(recall, 3), "\n")
+  cat("F1-Score:", round(f1, 3), "\n\n")
+  cat("AUC-ROC con pROC:", round(auc_value, 3), "\n")
   
-  test_df <- test_sf %>%
-    st_drop_geometry() %>%
-    dplyr::select(tiene_delito, x_norm, y_norm, dist_centro_norm, 
-           densidad_local_norm, cuadrante)
+  return(list(accuracy = accuracy, precision = precision, recall = recall, f1 = f1))
+}
+
+# Función para convertir dataframe a shapefile y graficar
+crear_shapefile <- function(datos, predicciones_prob, predicciones_class, nombre_conjunto) {
+  # Crear dataframe con todas las variables
+  datos_sf <- datos %>%
+    mutate(
+      pred_prob = predicciones_prob,
+      pred_class = predicciones_class,
+      conjunto = nombre_conjunto,
+      tipo_real = factor(tipo, levels = c(0, 1), labels = c("Hurto", "Robo")),
+      tipo_pred = factor(pred_class, levels = c(0, 1), labels = c("Hurto", "Robo")),
+      correcta = ifelse(tipo == pred_class, "Correcta", "Incorrecta")
+    )
+  
+  # Convertir a objeto sf (shapefile)
+  datos_sf <- st_as_sf(datos_sf, coords = c("longitud", "latitud"), crs = 4326)
+  
+  return(datos_sf)
+}
+
+# Creamos mapas comparativos
+
+crear_mapa_comparativo <- function(shapefile_data, titulo_conjunto) {
+  
+  # Extraer coordenadas para ggplot
+  coords <- st_coordinates(shapefile_data)
+  plot_data <- cbind(st_drop_geometry(shapefile_data), coords)
+  
+  # Mapa 1: Valores reales
+  mapa_real <- ggplot(plot_data, aes(x = X, y = Y)) +
+    geom_point(aes(color = tipo_real), alpha = 0.7, size = 0.8) +
+    scale_color_manual(values = c("Hurto" = "blue", "Robo" = "red"), 
+                       name = "Tipo Real") +
+    theme_minimal() +
+    theme(axis.text = element_text(size = 8),
+          legend.title = element_text(size = 9),
+          legend.text = element_text(size = 8)) +
+    labs(title = paste("Valores Reales -", titulo_conjunto),
+         x = "Longitud", y = "Latitud")
+  
+  # Mapa 2: Predicciones (probabilidades)
+  mapa_prob <- ggplot(plot_data, aes(x = X, y = Y)) +
+    geom_point(aes(color = pred_prob), alpha = 0.7, size = 0.8) +
+    scale_color_gradient2(low = "blue", mid = "white", high = "red", 
+                         midpoint = 0.5, name = "P(Robo)") +
+    theme_minimal() +
+    theme(axis.text = element_text(size = 8),
+          legend.title = element_text(size = 9),
+          legend.text = element_text(size = 8)) +
+    labs(title = paste("Probabilidades Predichas -", titulo_conjunto),
+         x = "Longitud", y = "Latitud")
+  
+  # Mapa 3: Predicciones (clases)
+  mapa_pred <- ggplot(plot_data, aes(x = X, y = Y)) +
+    geom_point(aes(color = tipo_pred), alpha = 0.7, size = 0.8) +
+    scale_color_manual(values = c("Hurto" = "blue", "Robo" = "red"), 
+                       name = "Tipo Pred.") +
+    theme_minimal() +
+    theme(axis.text = element_text(size = 8),
+          legend.title = element_text(size = 9),
+          legend.text = element_text(size = 8)) +
+    labs(title = paste("Clases Predichas -", titulo_conjunto),
+         x = "Longitud", y = "Latitud")
+  
+  # Mapa 4: Correctas vs Incorrectas
+  mapa_accuracy <- ggplot(plot_data, aes(x = X, y = Y)) +
+    geom_point(aes(color = correcta), alpha = 0.7, size = 0.8) +
+    scale_color_manual(values = c("Correcta" = "green", "Incorrecta" = "orange"), 
+                       name = "Predicción") +
+    theme_minimal() +
+    theme(axis.text = element_text(size = 8),
+          legend.title = element_text(size = 9),
+          legend.text = element_text(size = 8)) +
+    labs(title = paste("Precisión Espacial -", titulo_conjunto),
+         x = "Longitud", y = "Latitud")
+  
+  return(list(real = mapa_real, prob = mapa_prob, pred = mapa_pred, accuracy = mapa_accuracy))
+}
+```
+
+
+```{r}
+# Definimos cantidad de árboles a probar
+ntrees_valores <- c(50, 100, 200, 300, 400, 500)
+
+
+modelos_rf <- list()
+metricas_por_ntrees <- data.frame()
+errores_oob <- data.frame()
+predicciones_por_modelo <- list()
+
+set.seed(123)  # Para reproducibilidad
+
+
+# Entrenamos 
+for (i in seq_along(ntrees_valores)) {
+  ntree_actual <- ntrees_valores[i]
+  
   
   # Entrenar modelo
-  modelo <- glm(tiene_delito ~ x_norm + y_norm + dist_centro_norm + 
-                densidad_local_norm + cuadrante,
-                data = train_df, 
-                family = binomial())
+  modelo <- randomForest(factor(tipo) ~ latitud + longitud, 
+                        data = Train,
+                        ntree = ntree_actual,
+                        mtry = 2,
+                        importance = TRUE,
+                        do.trace = FALSE)
   
-  # Predicciones
-  pred_prob <- predict(modelo, test_df, type = "response")
+  modelos_rf[[as.character(ntree_actual)]] <- modelo
   
-  # Calcular AUC
-  roc_obj <- roc(test_df$tiene_delito, pred_prob, quiet = TRUE)
-  auc_val <- as.numeric(auc(roc_obj))
+  # Almacenar error OOB
+  errores_oob <- rbind(errores_oob,
+                      data.frame(ntrees = ntree_actual,
+                                error_oob = modelo$err.rate[ntree_actual, "OOB"]))
   
-  # Métricas adicionales
-  pred_class <- factor(ifelse(pred_prob > 0.5, "1", "0"), levels = c("0", "1"))
-  cm <- confusionMatrix(pred_class, test_df$tiene_delito, positive = "1")
-  
-  test_sf$pred_prob <- pred_prob
-  test_sf$pred_class <- pred_class
-  
-  
-  # GRÁFICO 1: Ocurrencia de delitos reales por celda
-  grafico_reales <- ggplot(test_sf) +
-    geom_sf(aes(fill = as.numeric(as.character(tiene_delito))), color = NA, size = 0.1) +
-    geom_sf(data = calles_hs, color = "gray80", size = 0.2) +
-    scale_fill_gradient(
-      low = "white", 
-      high = "red", 
-      name = "Delito\nReal",
-      breaks = c(0, 1), 
-      labels = c("No", "Sí")
-    ) +
-    ggtitle(paste("Delitos Reales -", tipo_delito, 
-                  "\n(Cell size:", cell_size, "m)")) +
-    theme_minimal() +
-    theme(
-      axis.text = element_blank(),
-      axis.ticks = element_blank(),
-      panel.grid = element_blank(),
-      legend.position = "right",
-      plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
-    )
-  
-  # GRÁFICO 2: Probabilidad predicha por celda
-  grafico_probabilidades <- ggplot(test_sf) +
-    geom_sf(aes(fill = pred_prob), color = NA, size = 0.1) +
-    geom_sf(data = calles_hs, color = "gray80", size = 0.2) +
-    scale_fill_gradient(
-      low = "white", 
-      high = "blue", 
-      name = "Prob.\nPredicha",
-      limits = c(0, 1)
-    ) +
-    ggtitle(paste("Probabilidades Predichas - Regresión Logística", tipo_delito,
-                  "\n(Cell size:", cell_size, "m | AUC:", round(auc_val, 3), ")")) +
-    theme_minimal() +
-    theme(
-      axis.text = element_blank(),
-      axis.ticks = element_blank(), 
-      panel.grid = element_blank(),
-      legend.position = "right",
-      plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
-    )
-  
-  return(list(
-    auc = auc_val,
-    accuracy = cm$overall["Accuracy"],
-    sensitivity = cm$byClass["Sensitivity"],
-    specificity = cm$byClass["Specificity"],
-    precision = cm$byClass["Pos Pred Value"],
-    cell_size = cell_size,
-    n_celdas_train = nrow(train_sf),
-    n_celdas_test = nrow(test_sf),
-    casos_positivos = sum(train_df$tiene_delito == "1"),
-    casos_negativos = sum(train_df$tiene_delito == "0"),
-    modelo = modelo,
-    train_data = train_sf,
-    test_data = test_sf,
-    test_data_con_predicciones = test_sf,  # Datos con predicciones para uso posterior
-    predicciones_prob = pred_prob,
-    predicciones_class = pred_class,
-    grafico_reales = grafico_reales,
-    grafico_probabilidades = grafico_probabilidades,
-    error = NULL
-  ))
 }
 
+# Evaluamos cada modelo
+for (i in seq_along(ntrees_valores)) {
+  ntree_actual <- ntrees_valores[i]
+  modelo <- modelos_rf[[as.character(ntree_actual)]]
+  
+  # Predicciones en Test
+  pred_prob <- predict(modelo, Test, type = "prob")[,2]
+  pred_class <- as.numeric(as.character(predict(modelo, Test, type = "class")))
+  
+  # Calcular métricas
+  tabla_confusion <- table(Observado = Test$tipo, Predicho = pred_class)
+  
+  accuracy <- sum(diag(tabla_confusion)) / sum(tabla_confusion)
+  precision <- ifelse(sum(tabla_confusion[,2]) > 0, 
+                     tabla_confusion[2,2] / sum(tabla_confusion[,2]), 0)
+  recall <- ifelse(sum(tabla_confusion[2,]) > 0, 
+                  tabla_confusion[2,2] / sum(tabla_confusion[2,]), 0)
+  f1 <- ifelse((precision + recall) > 0, 
+              2 * precision * recall / (precision + recall), 0)
+  roc_obj <- roc(Test$tipo, pred_prob, quiet = TRUE)
+  auc_value <- auc(roc_obj)
+  # Almacenar métricas
+  metricas_por_ntrees <- rbind(metricas_por_ntrees,
+                              data.frame(ntrees = ntree_actual,
+                                        accuracy = accuracy,
+                                        precision = precision,
+                                        recall = recall,
+                                        f1_score = f1,
+                                        auc_roc = auc_value))
+  
+  # Almacenar predicciones para análisis posterior
+  predicciones_por_modelo[[as.character(ntree_actual)]] <- list(
+    prob = pred_prob,
+    class = pred_class
+  )
+}
+
+
+# Graficamos el error OOB
+grafico_oob <- ggplot(errores_oob, aes(x = ntrees, y = error_oob)) +
+  geom_line(color = "red", size = 1.2) +
+  geom_point(color = "darkred", size = 3) +
+  geom_text(aes(label = round(error_oob, 3)), 
+            vjust = -0.5, hjust = 0.5, size = 3) +
+  theme_minimal() +
+  labs(title = "Error Out-of-Bag vs Número de Árboles",
+       x = "Número de Árboles",
+       y = "Error OOB") +
+  scale_x_continuous(breaks = ntrees_valores)
+
+# Graficamos métricas
+metricas_long <- metricas_por_ntrees %>%
+  tidyr::pivot_longer(cols = c(accuracy, precision, recall, f1_score),
+                      names_to = "metrica", values_to = "valor")
+
+grafico_metricas <- ggplot(metricas_long, aes(x = ntrees, y = valor, color = metrica)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(title = "Métricas en Conjunto Test vs Número de Árboles",
+       x = "Número de Árboles",
+       y = "Valor de la Métrica",
+       color = "Métrica") +
+  scale_x_continuous(breaks = ntrees_valores) +
+  scale_y_continuous(limits = c(0, 1)) +
+  theme(legend.position = "bottom")
+
+
+# Mostrar gráficos
+
+print(grafico_oob)
+print(grafico_metricas)
+
+
+# Hacemos una tabla resumen
+
+tabla_resumen <- merge(tiempos_entrenamiento, errores_oob, by = "ntrees")
+tabla_resumen <- merge(tabla_resumen, metricas_por_ntrees, by = "ntrees")
+
+# Formatear tabla para mostrar
+tabla_mostrar <- tabla_resumen %>%
+  mutate(
+  
+    error_oob = round(error_oob, 4),
+    accuracy = round(accuracy, 3),
+    precision = round(precision, 3),
+    recall = round(recall, 3),
+    f1_score = round(f1_score, 3),
+    auc_roc = round(auc_roc, 3)
+  ) %>%
+  dplyr::select(ntrees, error_oob, accuracy, precision, recall, f1_score, auc_roc)
+
+print(tabla_mostrar)
+
+
+# Recomendar número óptimo de árboles
+mejor_f1_idx <- which.max(metricas_por_ntrees$f1_score)
+mejor_ntrees_f1 <- ntrees_valores[mejor_f1_idx]
+mejor_f1 <- max(metricas_por_ntrees$f1_score)
+
+mejor_accuracy_idx <- which.max(metricas_por_ntrees$accuracy)
+mejor_ntrees_accuracy <- ntrees_valores[mejor_accuracy_idx]
+mejor_accuracy <- max(metricas_por_ntrees$accuracy)
+
+mejor_aucroc_idx <- which.max(metricas_por_ntrees$auc_roc)
+mejor_ntrees_aucroc <- ntrees_valores[mejor_aucroc_idx]
+mejor_aucroc <- max(metricas_por_ntrees$auc_roc)
+
+
+cat("Mejor F1-Score:", mejor_ntrees_f1, "árboles (F1 =", round(mejor_f1, 3), ")\n")
+cat("Mejor Accuracy:", mejor_ntrees_accuracy, "árboles (Acc =", round(mejor_accuracy, 3), ")\n")
+cat("Mejor AUC-ROC:", mejor_ntrees_aucroc, "árboles (F1 =", round(mejor_aucroc, 3), ")\n")
 ```
 
 
+
 ```{r}
-optimizar_cellsize_logistica <- function(train_data, test_data, tipo_delito, columna_delito = "tipo") {
+
+
+# Definimos los mejores hiperparámetros
+# Definir grid de parámetros
+nrounds_grid <- seq(50, 100, by = 10)  # 50, 60, 70, 80, 90, 100
+eta_grid <- c(0.1, 0.2, 0.3)
+max_depth_fijo <- 6
+
+# Crear grid completo de combinaciones
+param_grid <- expand.grid(
+  nrounds = nrounds_grid,
+  eta = eta_grid,
+  max_depth = max_depth_fijo,
+  stringsAsFactors = FALSE
+)
+
+# Preparar datos para XGBoost
+dtrain <- xgb.DMatrix(data = as.matrix(Train[, c("latitud", "longitud")]), 
+                      label = Train$tipo)
+dtest <- xgb.DMatrix(data = as.matrix(Test[, c("latitud", "longitud")]), 
+                     label = Test$tipo)
+
+dpreTrain <- xgb.DMatrix(data = as.matrix(preTrain[, c("latitud", "longitud")]), 
+                      label = preTrain$tipo)
+dvalidation <- xgb.DMatrix(data = as.matrix(Validation[, c("latitud", "longitud")]), 
+                          label = Validation$tipo)
+
+# Inicializar estructuras para almacenar resultados
+modelos_xgb <- list()
+resultados_grid <- data.frame()
+predicciones_por_modelo <- list()
+
+set.seed(123)  # Para reproducibilidad
+
+# Entrenamos modelos
+
+for (i in 1:nrow(param_grid)) {
+  params <- param_grid[i, ]
+  nrounds_actual <- params$nrounds
+  eta_actual <- params$eta
+  max_depth_actual <- params$max_depth
   
-  # Cell sizes a probar
-  cell_sizes <- c(50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000)
+  combo_name <- paste0("nr", nrounds_actual, "_eta", eta_actual, "_md", max_depth_actual)
+
+ 
   
-  # Lista para almacenar resultados
-  resultados <- list()
-  
-  # Probar cada cell_size
-  for(i in seq_along(cell_sizes)) {
-    cs <- cell_sizes[i]
-    resultado <- entrenar_evaluar_logistica(train_data, test_data, tipo_delito, columna_delito, cs)
-    resultados[[i]] <- resultado
-  }
-  
-  # Filtrar solo resultados válidos (con AUC > 0)
-  resultados_validos <- resultados[sapply(resultados, function(x) x$auc > 0)]
-  
-  # Encontrar el mejor AUC
-  aucs <- sapply(resultados_validos, function(x) x$auc)
-  mejor_idx <- which.max(aucs)
-  mejor_resultado <- resultados_validos[[mejor_idx]]
-  
-  # Crear tabla de resultados
-  tabla_resultados <- data.frame(
-    cell_size = sapply(resultados_validos, function(x) x$cell_size),
-    auc = sapply(resultados_validos, function(x) round(x$auc, 4)),
-    accuracy = sapply(resultados_validos, function(x) round(x$accuracy, 4)),
-    n_celdas_train = sapply(resultados_validos, function(x) x$n_celdas_train),
-    n_celdas_test = sapply(resultados_validos, function(x) x$n_celdas_test),
-    casos_pos = sapply(resultados_validos, function(x) x$casos_positivos),
-    casos_neg = sapply(resultados_validos, function(x) x$casos_negativos)
+  # Parámetros del modelo
+  params_xgb <- list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    eta = eta_actual,
+    max_depth = max_depth_actual,
+    subsample = 0.8,
+    colsample_bytree = 1.0,
+    seed = 123
   )
   
-  # Ordenar por AUC descendente
-  tabla_resultados <- tabla_resultados[order(-tabla_resultados$auc), ]
-  
-  cat("\n=== RESULTADOS PARA", tipo_delito, "===\n")
-  print(tabla_resultados)
-  
-  cat("\n=== MEJOR MODELO ===\n")
-  cat("Cell Size Óptimo:", mejor_resultado$cell_size, "metros\n")
-  cat("AUC-ROC:", round(mejor_resultado$auc, 4), "\n")
-  cat("Accuracy:", round(mejor_resultado$accuracy, 4), "\n")
-  cat("Sensitivity:", round(mejor_resultado$sensitivity, 4), "\n")
-  cat("Specificity:", round(mejor_resultado$specificity, 4), "\n")
-  cat("Precision:", round(mejor_resultado$precision, 4), "\n")
-  cat("Celdas Train:", mejor_resultado$n_celdas_train, "\n")
-  cat("Celdas Test:", mejor_resultado$n_celdas_test, "\n")
-  
-  # Plot comparativo
-  plot(tabla_resultados$cell_size, tabla_resultados$auc, 
-       type = "b", pch = 19, col = "blue",
-       xlab = "Cell Size (metros)", ylab = "AUC-ROC",
-       main = paste("Optimización Cell Size -", tipo_delito),
-       ylim = c(min(tabla_resultados$auc) - 0.05, max(tabla_resultados$auc) + 0.05))
-  
-  # Marcar el mejor
-  points(mejor_resultado$cell_size, mejor_resultado$auc, 
-         pch = 19, col = "red", cex = 2)
-  text(mejor_resultado$cell_size, mejor_resultado$auc + 0.02, 
-       paste("Mejor:", mejor_resultado$cell_size, "m"), 
-       col = "red", font = 2)
-  
-  grid()
-  
-  return(list(
-    mejor_modelo = mejor_resultado,
-    todos_resultados = resultados_validos,
-    tabla_resultados = tabla_resultados,
-    tipo_delito = tipo_delito
-  ))
-}
-
-
-# Optimizar para HURTO
-cat("\n" %+% paste(rep("=", 60), collapse="") %+% "\n")
-optimizacion_hurto <- optimizar_cellsize_logistica(Train, Test, "Hurto", "tipo")
-
-# Optimizar para ROBO
-cat("\n" %+% paste(rep("=", 60), collapse="") %+% "\n")
-optimizacion_robo <- optimizar_cellsize_logistica(Train, Test, "Robo", "tipo")
-
-# COMPARACIÓN FINAL
-cat("HURTO - Mejor Cell Size:", optimizacion_hurto$mejor_modelo$cell_size, 
-      "m | AUC:", round(optimizacion_hurto$mejor_modelo$auc, 4), "\n")
-
-cat("ROBO  - Mejor Cell Size:", optimizacion_robo$mejor_modelo$cell_size, 
-      "m | AUC:", round(optimizacion_robo$mejor_modelo$auc, 4), "\n")
-
-if(optimizacion_hurto$mejor_modelo$auc > optimizacion_robo$mejor_modelo$auc) {
-   cat("\nMejor AUC Hurto =", round(optimizacion_hurto$mejor_modelo$auc, 4), "\n")
-} else {
-  cat("\nMejor AUC Robo =", round(optimizacion_robo$mejor_modelo$auc, 4), "\n")
-}
-```
-
-```{r}
-explorar_hiperparametros_rf <- function(train_data, test_data, tipo_delito, columna_delito = "tipo") {
-  
-  # Parámetros a probar
-  ntrees_grid <- c(50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000)
-  mtry_grid <- c(2, 3, 4, 5)
-  
-  # Preparar datos con cell_size = 50
-  train_sf <- crear_dataset_espacial_optimizado(train_data, tipo_delito, columna_delito, cell_size = 50)
-  test_sf <- crear_dataset_espacial_optimizado(test_data, tipo_delito, columna_delito, cell_size = 50)
-  
-  # Convertir a dataframe
-  train_df <- train_sf %>%
-    st_drop_geometry() %>%
-    dplyr::select(tiene_delito, x_norm, y_norm, dist_centro_norm, 
-           densidad_local_norm, cuadrante)
-  
-  test_df <- test_sf %>%
-    st_drop_geometry() %>%
-    dplyr::select(tiene_delito, x_norm, y_norm, dist_centro_norm, 
-           densidad_local_norm, cuadrante)
-  
-  # Inicializar resultados
-  resultados_grid <- data.frame(
-    ntree = integer(),
-    mtry = integer(),
-    auc = numeric(),
-    accuracy = numeric(),
-    sensitivity = numeric(),
-    specificity = numeric(),
-    precision = numeric(),
-    oob_error = numeric(),
-    tiempo_entrenamiento = numeric(),
-    stringsAsFactors = FALSE
+  # Entrenar modelo
+  modelo <- xgb.train(
+    params = params_xgb,
+    data = dtrain,
+    nrounds = nrounds_actual,
+    watchlist = list(train = dtrain, eval = dtest),
+    verbose = 0,
+    early_stopping_rounds = 10
   )
-  
-  # Variables para tracking del mejor modelo
-  mejor_auc <- 0
-  mejor_modelo <- NULL
-  mejor_config <- NULL
-  mejor_predicciones <- NULL
-  
-  # Total de combinaciones
-  total_combinaciones <- length(ntrees_grid) * length(mtry_grid)
-  combinacion_actual <- 0
-  
-  # Grid search
-  for(ntree in ntrees_grid) {
-    for(mtry in mtry_grid) {
-      
-      combinacion_actual <- combinacion_actual + 1
-      
-      # Medir tiempo de entrenamiento
-      tiempo_inicio <- Sys.time()
-
-# Entrenar modelo
-        modelo_rf <- randomForest(
-          tiene_delito ~ ., 
-          data = train_df,
-          ntree = ntree,
-          mtry = mtry,
-          importance = TRUE,
-          proximity = FALSE,
-          do.trace = FALSE  # Silenciar output
-        )
-        
-        tiempo_fin <- Sys.time()
-        tiempo_entrenamiento <- as.numeric(difftime(tiempo_fin, tiempo_inicio, units = "secs"))
-        
-        # Predicciones en test
-        pred_prob <- predict(modelo_rf, test_df, type = "prob")[,2]
-        pred_class <- predict(modelo_rf, test_df, type = "class")
-        
-        # Métricas de evaluación
-        cm <- confusionMatrix(pred_class, test_df$tiene_delito, positive = "1")
-        
-        # AUC-ROC
-        roc_obj <- roc(test_df$tiene_delito, pred_prob, quiet = TRUE)
-        auc_val <- auc(roc_obj)
-        
-        # OOB Error
-        oob_error <- modelo_rf$err.rate[ntree, "OOB"]
-        
-        # Guardar resultados
-        resultados_grid <- rbind(resultados_grid, data.frame(
-          ntree = ntree,
-          mtry = mtry,
-          auc = as.numeric(auc_val),
-          accuracy = as.numeric(cm$overall["Accuracy"]),
-          recall = as.numeric(cm$byClass["Recall"]),
-          precision = as.numeric(cm$byClass["Pos Pred Value"]),
-          oob_error = oob_error,
-          tiempo_entrenamiento = tiempo_entrenamiento
-        ))
-        
-        
-        # Verificar si es el mejor modelo hasta ahora
-        if(auc_val > mejor_auc) {
-          mejor_auc <- auc_val
-          mejor_modelo <- modelo_rf
-          mejor_config <- list(ntree = ntree, mtry = mtry)
-          mejor_predicciones <- list(
-            prob = pred_prob,
-            class = pred_class,
-            roc = roc_obj,
-            cm = cm
-          )
-        }
-    }
-  }
-  
-  # Ordenar resultados por AUC
-  resultados_grid <- resultados_grid[order(-resultados_grid$auc, na.last = TRUE), ]
-  
-  
-  # Información del mejor modelo
-  cat("\n=== MEJOR MODELO ENCONTRADO ===\n")
-  cat("Configuración: ntree =", mejor_config$ntree, ", mtry =", mejor_config$mtry, "\n")
-  cat("AUC-ROC:", round(mejor_auc, 4), "\n")
-  
-  
-  cat("\nMatriz de Confusión:\n")
-  cm_table <- mejor_predicciones$cm$table
-  print(cm_table)
-  cat("Accuracy: ", round(mejor_predicciones$cm$overall["Accuracy"], 4), "\n")
-  cat("Precision:", round(mejor_predicciones$cm$byClass["Pos Pred Value"], 4), "\n") 
-  cat("Recall:   ", round(mejor_predicciones$cm$byClass["Recall"], 4), "\n")
-  # Importancia de variables del mejor modelo
-  cat("\nImportancia de variables (mejor modelo):\n")
-  importancia <- importance(mejor_modelo)
-  print(round(importancia, 4))
-  
-  # ROC Curve
-  plot(mejor_predicciones$roc, 
-       main = paste("Curva ROC - Mejor RF", tipo_delito, 
-                   "\n(ntree =", mejor_config$ntree, ", mtry =", mejor_config$mtry, ")"),
-       col = "darkgreen", lwd = 2)
-  legend("bottomright", paste("AUC =", round(mejor_auc, 4)), cex = 1.2)
-  
-  # Variable Importance Plot
-  varImpPlot(mejor_modelo, 
-            main = paste("Importancia Variables - Mejor RF", tipo_delito,
-                        "\n(ntree =", mejor_config$ntree, ", mtry =", mejor_config$mtry, ")"))
-  
-  resultados_clean <- resultados_grid[!is.na(resultados_grid$auc), ]
-  
-  
-  # Preparar datos de test con predicciones para visualización espacial
-  test_sf$pred_prob <- mejor_predicciones$prob
-  test_sf$pred_class <- mejor_predicciones$class
-  
-  # Visualización espacial
-  p1 <- ggplot(test_sf) +
-    geom_sf(aes(fill = as.numeric(as.character(tiene_delito))), color = NA) +
-    geom_sf(data = calles_hs, color = "gray80", size = 0.2) +
-    scale_fill_gradient(low = "white", high = "red", name = "Delitos\nReales") +
-    ggtitle(paste("Delitos Reales -", tipo_delito, "(Cell size: 50m)")) +
-    theme_minimal()
-  
-  p2 <- ggplot(test_sf) +
-    geom_sf(aes(fill = pred_prob), color = NA) +
-    geom_sf(data = calles_hs, color = "gray80", size = 0.2) +
-    scale_fill_gradient(low = "white", high = "darkgreen", name = "Prob.\nPredicha") +
-    ggtitle(paste("Probabilidades Predichas - Mejor RF", tipo_delito,
-                  "\n(ntree =", mejor_config$ntree, ", mtry =", mejor_config$mtry, ")")) +
-    theme_minimal()
-  
-  print(p1)
-  print(p2)
-  
-  # Retornar resultados completos
-  return(list(
-    mejor_modelo = mejor_modelo,
-    mejor_config = mejor_config,
-    mejor_auc = mejor_auc,
-    mejor_predicciones = mejor_predicciones,
-    resultados_completos = resultados_grid,
-    train_data = train_sf,
-    test_data = test_sf,
-    importancia = importancia
-  ))
-}
-
-
-resultado_grid_hurto <- explorar_hiperparametros_rf(Train, Test, "Hurto", columna_delito = "tipo")
-
-resultado_grid_robo <- explorar_hiperparametros_rf(Train, Test, "Robo", columna_delito = "tipo")
-
-# Resumen final comparativo
-cat("\n=== RESUMEN FINAL DE MEJORES MODELOS ===\n")
-cat("TIPO DELITO\t\tMEJOR CONFIG\t\t\tAUC\n")
-cat("-------------------------------------------------------\n")
-
-cat("HURTO\t\t\tntree =", resultado_grid_hurto$mejor_config$ntree,
-    ", mtry =", resultado_grid_hurto$mejor_config$mtry, 
-    "\t\t", round(resultado_grid_hurto$mejor_auc, 4), "\n")
-  
-cat("ROBO\t\t\tntree =", resultado_grid_robo$mejor_config$ntree, 
-      ", mtry =", resultado_grid_robo$mejor_config$mtry, 
-      "\t\t", round(resultado_grid_robo$mejor_auc, 4), "\n")
-```
-
-```{r}
-
-explorar_hiperparametros_xgb <- function(train_data, test_data, tipo_delito, columna_delito = NULL) {
-
-  
-  # Parámetros a probar
-  nrounds_grid <- seq(50, 100, by = 10)  # 50, 60, 70, 80, 90, 100
-  eta_grid <- c(0.1, 0.2, 0.3)
-  max_depth_fijo <- 6  
-  
-  # Preparar datos con cell_size = 50
-  train_sf <- crear_dataset_espacial_optimizado(train_data, tipo_delito, columna_delito, cell_size = 50)
-  test_sf <- crear_dataset_espacial_optimizado(test_data, tipo_delito, columna_delito, cell_size = 50)
-  
-  # Convertir a dataframe
-  train_df <- train_sf %>%
-    st_drop_geometry() %>%
-    dplyr::select(tiene_delito, x_norm, y_norm, dist_centro_norm, 
-           densidad_local_norm, cuadrante)
-  
-  test_df <- test_sf %>%
-    st_drop_geometry() %>%
-    dplyr::select(tiene_delito, x_norm, y_norm, dist_centro_norm, 
-           densidad_local_norm, cuadrante)
-  
   
  
   
-  # Preparar matrices para XGBoost
+  # Almacenar modelo
+  modelos_xgb[[combo_name]] <- modelo
   
-  train_matrix <- model.matrix(tiene_delito ~ . - 1, data = train_df)
-  test_matrix <- model.matrix(tiene_delito ~ . - 1, data = test_df)
+  # Hacer predicciones en Test
+  pred_prob <- predict(modelo, dtest)
+  pred_class <- ifelse(pred_prob > 0.5, 1, 0)
   
-  # Convertir target a numérico (0/1)
-  train_label <- as.numeric(train_df$tiene_delito) - 1
-  test_label <- as.numeric(test_df$tiene_delito) - 1
+  # Calcular métricas
+  tabla_confusion <- table(Observado = Test$tipo, Predicho = pred_class)
   
-  # Crear DMatrix para XGBoost
-  dtrain <- xgb.DMatrix(data = train_matrix, label = train_label)
-  dtest <- xgb.DMatrix(data = test_matrix, label = test_label)
+  accuracy <- sum(diag(tabla_confusion)) / sum(tabla_confusion)
+  precision <- ifelse(sum(tabla_confusion[,2]) > 0, 
+                     tabla_confusion[2,2] / sum(tabla_confusion[,2]), 0)
+  recall <- ifelse(sum(tabla_confusion[2,]) > 0, 
+                  tabla_confusion[2,2] / sum(tabla_confusion[2,]), 0)
+  f1 <- ifelse((precision + recall) > 0, 
+              2 * precision * recall / (precision + recall), 0)
   
-  # Inicializar resultados
-  resultados_grid <- data.frame(
-    nrounds = integer(),
-    eta = numeric(),
-    max_depth = integer(),
-    auc = numeric(),
-    accuracy = numeric(),
-    sensitivity = numeric(),
-    specificity = numeric(),
-    precision = numeric(),
-    train_auc = numeric(),
-    test_auc = numeric(),
-    tiempo_entrenamiento = numeric(),
+  roc_obj <- roc(Test$tipo, pred_prob, quiet = TRUE)
+  auc_value <- auc(roc_obj)
+  # Obtener error de entrenamiento final
+  train_error <- modelo$evaluation_log$train_logloss[nrow(modelo$evaluation_log)]
+  eval_error <- modelo$evaluation_log$eval_logloss[nrow(modelo$evaluation_log)]
+  
+  # Almacenar resultados
+  resultados_grid <- rbind(resultados_grid, data.frame(
+    combo = combo_name,
+    nrounds = nrounds_actual,
+    eta = eta_actual,
+    max_depth = max_depth_actual,
+    tiempo_seg = tiempo_transcurrido,
+    train_logloss = train_error,
+    eval_logloss = eval_error,
+    accuracy = accuracy,
+    precision = precision,
+    recall = recall,
+    f1_score = f1,
+    auc_roc = auc_value,
     stringsAsFactors = FALSE
+  ))
+  
+  # Almacenar predicciones para análisis posterior
+  predicciones_por_modelo[[combo_name]] <- list(
+    prob = pred_prob,
+    class = pred_class
   )
-  
-  # Variables para tracking del mejor modelo
-  mejor_auc <- 0
-  mejor_modelo <- NULL
-  mejor_config <- NULL
-  mejor_predicciones <- NULL
-  mejor_matrices <- NULL
-  
-  # Total de combinaciones
-  total_combinaciones <- length(nrounds_grid) * length(eta_grid)
-  combinacion_actual <- 0
 
+}
+
+
+
+# Encontrar mejores modelos
+mejor_f1_idx <- which.max(resultados_grid$f1_score)
+mejor_accuracy_idx <- which.max(resultados_grid$accuracy)
+mejor_precision_idx <- which.max(resultados_grid$precision)
+mejor_recall_idx <- which.max(resultados_grid$recall)
+mejor_aucroc_idx <- which.max(resultados_grid$auc_roc)
+
+cat("Mejor F1-Score:", round(resultados_grid$f1_score[mejor_f1_idx], 3), 
+    "| Combo:", resultados_grid$combo[mejor_f1_idx], "\n")
+cat("Mejor Accuracy:", round(resultados_grid$accuracy[mejor_accuracy_idx], 3), 
+    "| Combo:", resultados_grid$combo[mejor_accuracy_idx], "\n")
+cat("Mejor Precision:", round(resultados_grid$precision[mejor_precision_idx], 3), 
+    "| Combo:", resultados_grid$combo[mejor_precision_idx], "\n")
+cat("Mejor Recall:", round(resultados_grid$recall[mejor_recall_idx], 3), 
+    "| Combo:", resultados_grid$combo[mejor_recall_idx], "\n")
+cat("Mejor AUC-ROC:", round(resultados_grid$auc_roc[mejor_aucroc_idx], 3), 
+    "| Combo:", resultados_grid$combo[mejor_aucroc_idx], "\n\n")
+
+
+# Seleccionar top 3 modelos
+mejor_modelo <- resultados_grid[order(resultados_grid$auc_roc, decreasing = TRUE)[1], ]
+combo_name <- mejor_modelo$combo
   
-  # Grid search
-  for(nrounds in nrounds_grid) {
-    for(eta in eta_grid) {
+# Obtener predicciones
+pred_prob <- predicciones_por_modelo[[combo_name]]$prob
+pred_class <- predicciones_por_modelo[[combo_name]]$class
+  
+# Crear shapefile para Test
+datos_sf <- Test %>%
+mutate(
+  pred_prob_xgb = pred_prob,
+  pred_class_xgb = pred_class,
+  combo = combo_name,
+  tipo_real = factor(tipo, levels = c(0, 1), labels = c("Hurto", "Robo")),
+  tipo_pred_xgb = factor(pred_class_xgb, levels = c(0, 1), labels = c("Hurto", "Robo")),
+  correcta_xgb = ifelse(tipo == pred_class_xgb, "Correcta", "Incorrecta")
+) %>%
+st_as_sf(coords = c("longitud", "latitud"), crs = 4326)
+
+pred_data <- data.frame(
+  longitud = Test$longitud,
+  latitud = Test$latitud,
+  prob_robo = predicciones_por_modelo[[combo_name]]$prob,
+  tipo_real = factor(Test$tipo, levels = c(0, 1), labels = c("Hurto", "Robo"))
+)
+
+
+tabla_resumen_xgb <- resultados_grid %>%
+  mutate(
+    eval_logloss = round(eval_logloss, 4),
+    accuracy = round(accuracy, 3),
+    precision = round(precision, 3),
+    recall = round(recall, 3),
+    f1_score = round(f1_score, 3),
+    auc_roc = round(auc_roc, 4)
+  ) %>%
+  arrange(desc(auc_roc))
+
+print(tabla_resumen_xgb)
+
+mejor_modelo <- resultados_grid[mejor_aucroc_idx, ]
+
+cat("Combinación:", mejor_modelo$combo, "\n")
+cat("nrounds =", mejor_modelo$nrounds, "| eta =", mejor_modelo$eta, 
+    "| max_depth =", mejor_modelo$max_depth, "\n")
+cat("F1-Score:", round(mejor_modelo$f1_score, 3), "\n")
+cat("AUC-ROC:", round(mejor_modelo$auc_roc, 3), "\n")
+
+
+
+```
+
+
+Ahora que conocemos las mejores configuracioens de XGBoost y RF, comparemos los resultados de los tres modelos entrenados.
+
+Regresión logística
+
+```{r}
+# Entrenar el modelo de regresión logística
+modelo_logistico <- glm(tipo ~ latitud + longitud, 
+                       data = Train, 
+                       family = binomial())
+
+# Predecimos las respuestas
+pred_train_prob <- predict(modelo_logistico, Train, type = "response")
+pred_test_prob <- predict(modelo_logistico, Test, type = "response")
+
+# Binarizamos
+pred_train_class <- ifelse(pred_train_prob > 0.5, 1, 0)
+pred_test_class <- ifelse(pred_test_prob > 0.5, 1, 0)
+
+
+# Evaluar en todos los conjuntos
+metricas_train <- calcular_metricas(Train$tipo, pred_train_class, pred_train_prob, "TRAIN")
+metricas_test <- calcular_metricas(Test$tipo, pred_test_class,pred_test_prob ,"TEST")
+
+shapefile_train <- crear_shapefile(Train, pred_train_prob, pred_train_class, "Train")
+shapefile_test <- crear_shapefile(Test, pred_test_prob, pred_test_class, "Test")
+
+mapas_train <- crear_mapa_comparativo(shapefile_train, "TRAIN")
+mapas_test <- crear_mapa_comparativo(shapefile_test, "TEST")
+
+
+grid.arrange(mapas_train$real, mapas_train$pred, ncol = 2)
+grid.arrange(mapas_test$real, mapas_test$pred, ncol = 2)
+grid.arrange(mapas_train$prob, mapas_train$accuracy, ncol = 2)
+grid.arrange(mapas_test$prob, mapas_test$accuracy, ncol = 2)
+
+
+# Estadísticas del Train
+cat("=== ESTADÍSTICAS SHAPEFILE TRAIN ===\n")
+cat("Total puntos:", nrow(shapefile_train), "\n")
+cat("Predicciones correctas:", sum(shapefile_train$correcta == "Correcta"), "\n")
+cat("Accuracy:", round(mean(shapefile_train$correcta == "Correcta"), 3), "\n")
+cat("Distribución real - Hurtos:", sum(shapefile_train$tipo == 0), "| Robos:", sum(shapefile_train$tipo == 1), "\n")
+cat("Distribución pred - Hurtos:", sum(shapefile_train$pred_class == 0), "| Robos:", sum(shapefile_train$pred_class == 1), "\n\n")
+
+# Estadísticas del Test
+cat("=== ESTADÍSTICAS SHAPEFILE TEST ===\n")
+cat("Total puntos:", nrow(shapefile_test), "\n")
+cat("Predicciones correctas:", sum(shapefile_test$correcta == "Correcta"), "\n")
+cat("Accuracy:", round(mean(shapefile_test$correcta == "Correcta"), 3), "\n")
+cat("Distribución real - Hurtos:", sum(shapefile_test$tipo == 0), "| Robos:", sum(shapefile_test$tipo == 1), "\n")
+cat("Distribución pred - Hurtos:", sum(shapefile_test$pred_class == 0), "| Robos:", sum(shapefile_test$pred_class == 1), "\n\n")
+```
+
+```{r}
+modelo <- randomForest(factor(tipo) ~ latitud + longitud, 
+                        data = Train,
+                        ntree = 100,
+                        mtry = 2,
+                        importance = TRUE,
+                        do.trace = FALSE)
+
+pred_train_prob<- predict(modelo, Train, type = "prob")[,2]
+pred_train_class <- as.numeric(as.character(predict(modelo, Train, type = "class")))
+
+pred_test_prob <- predict(modelo, Test, type = "prob")[,2]
+pred_test_class <- as.numeric(as.character(predict(modelo, Test, type = "class")))
+
+shapefile_train <- crear_shapefile(Train, pred_train_prob, pred_train_class, "Train")
+shapefile_test <- crear_shapefile(Test, pred_test_prob, pred_test_class, "Test")
+
+
+mapas_train <- crear_mapa_comparativo(shapefile_train, "TRAIN")
+mapas_test <- crear_mapa_comparativo(shapefile_test, "TEST")
+
+
+
+plot(roc(Train$tipo, pred_train_prob, quiet = TRUE), 
+     main = paste("Curva ROC en Train") , 
+     col = "blue", 
+     lwd = 2,
+     print.auc = TRUE)
+
+plot(roc(Test$tipo, pred_test_prob, quiet = TRUE), 
+   main = paste("Curva ROC en Test") , 
+   col = "blue", 
+   lwd = 2,
+   print.auc = TRUE)
+
+grid.arrange(mapas_train$real, mapas_train$pred, ncol = 2)
+grid.arrange(mapas_test$real, mapas_test$pred, ncol = 2)
+grid.arrange(mapas_train$prob, mapas_train$accuracy, ncol = 2)
+grid.arrange(mapas_test$prob, mapas_test$accuracy, ncol = 2)
+```
+
+```{r}
+params_xgb <- list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    eta = 0.2,
+    max_depth = 6,
+    subsample = 0.8,
+    colsample_bytree = 1.0,
+    seed = 123
+  )
+
+modelo <- xgb.train(
+  params = params_xgb,
+  data = dtrain,
+  nrounds = 60,
+  watchlist = list(train = dtrain, eval = dtest),
+  verbose = 0,
+  early_stopping_rounds = 10
+)
+
+
+pred_train_prob <- predict(modelo, dtrain)
+pred_train_class <- ifelse(pred_train_prob > 0.5, 1, 0)
+
+pred_test_prob <- predict(modelo, dtest)
+pred_test_class <- ifelse(pred_test_prob > 0.5, 1, 0)
+
+
+
+shapefile_train <- crear_shapefile(Train, pred_train_prob, pred_train_class, "Train")
+shapefile_test <- crear_shapefile(Test, pred_test_prob, pred_test_class, "Test")
+
+
+mapas_train <- crear_mapa_comparativo(shapefile_train, "TRAIN")
+mapas_test <- crear_mapa_comparativo(shapefile_test, "TEST")
+
+
+plot(roc(Train$tipo, pred_train_prob, quiet = TRUE), 
+     main = paste("Curva ROC en Train") , 
+     col = "blue", 
+     lwd = 2,
+     print.auc = TRUE)
+
+plot(roc(Test$tipo, pred_test_prob, quiet = TRUE), 
+   main = paste("Curva ROC en Test") , 
+   col = "blue", 
+   lwd = 2,
+   print.auc = TRUE)
+
+grid.arrange(mapas_train$real, mapas_train$pred, ncol = 2)
+grid.arrange(mapas_test$real, mapas_test$pred, ncol = 2)
+grid.arrange(mapas_train$prob, mapas_train$accuracy, ncol = 2)
+grid.arrange(mapas_test$prob, mapas_test$accuracy, ncol = 2)
+
+```
+
+
+Ahora que tenemos definidas las mejores configuraciones, determinemos con validación cuál es el mejor de estos tres modelos. Para determinar esto utilizaremos el AUC-ROC.
+
+```{r}
+modelo_logistico <- glm(tipo ~ latitud + longitud, 
+                       data = preTrain, 
+                       family = binomial())
+
+# Predecimos las respuestas
+pred_Validation_prob <- predict(modelo_logistico, Validation, type = "response")
+
+# Binarizamos
+pred_Validation_class <- ifelse(pred_Validation_prob > 0.5, 1, 0)
+
+
+# Evaluar en todos los conjuntos
+metricas_Validation <- calcular_metricas(Validation$tipo, pred_Validation_class,pred_Validation_prob ,"Validation")
+
+shapefile_Validation <- crear_shapefile(Validation, pred_Validation_prob, pred_Validation_class, "Validation")
+
+mapas_Validation <- crear_mapa_comparativo(shapefile_Validation, "VALIDATION")
+
+grid.arrange(mapas_Validation$real, mapas_Validation$pred, ncol = 2)
+grid.arrange(mapas_Validation$prob, mapas_Validation$accuracy, ncol = 2)
+
+# Estadísticas del Test
+cat("Total puntos:", nrow(shapefile_Validation), "\n")
+cat("Predicciones correctas:", sum(shapefile_Validation$correcta == "Correcta"), "\n")
+cat("Accuracy:", round(mean(shapefile_Validation$correcta == "Correcta"), 3), "\n")
+cat("Distribución real - Hurtos:", sum(shapefile_Validation$tipo == 0), "| Robos:", sum(shapefile_Validation$tipo == 1), "\n")
+cat("Distribución pred - Hurtos:", sum(shapefile_Validation$pred_class == 0), "| Robos:", sum(shapefile_Validation$pred_class == 1), "\n\n")
+```
+
+
+```{r}
+modelo <- randomForest(factor(tipo) ~ latitud + longitud, 
+                        data = preTrain,
+                        ntree = 100,
+                        mtry = 2,
+                        importance = TRUE,
+                        do.trace = FALSE)
+
+pred_Validation_prob <- predict(modelo, Validation, type = "prob")[,2]
+pred_Validation_class <- as.numeric(as.character(predict(modelo, Validation, type = "class")))
+shapefile_Validation <- crear_shapefile(Validation, pred_Validation_prob, pred_Validation_class, "VALIDATION")
+mapas_Validation <- crear_mapa_comparativo(shapefile_Validation, "VALIDATION")
+
+plot(roc(Validation$tipo, pred_Validation_prob, quiet = TRUE), 
+   main = paste("Curva ROC en VALIDATION") , 
+   col = "blue", 
+   lwd = 2,
+   print.auc = TRUE)
+
+grid.arrange(mapas_Validation$real, mapas_Validation$pred, ncol = 2)
+grid.arrange(mapas_Validation$prob, mapas_Validation$accuracy, ncol = 2)
+```
+
+```{r}
+
+params_xgb <- list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    eta = 0.2,
+    max_depth = 6,
+    subsample = 0.8,
+    colsample_bytree = 1.0,
+    seed = 123
+  )
+
+modelo <- xgb.train(
+  params = params_xgb,
+  data = dpreTrain,
+  nrounds = 60,
+  watchlist = list(train = dpreTrain, eval = dvalidation),
+  verbose = 0,
+  early_stopping_rounds = 10
+)
+
+pred_validation_prob <- predict(modelo, dvalidation)
+pred_validation_class <- ifelse(pred_validation_prob > 0.5, 1, 0)
+shapefile_validation <- crear_shapefile(Validation, pred_validation_prob, pred_validation_class, "Validation")
+mapas_test <- crear_mapa_comparativo(shapefile_validation, "VALIDATION")
+
+plot(roc(Validation$tipo, pred_validation_prob, quiet = TRUE), 
+   main = paste("Curva ROC en Validation") , 
+   col = "blue", 
+   lwd = 2,
+   print.auc = TRUE)
+
+grid.arrange(mapas_test$real, mapas_test$pred, ncol = 2)
+grid.arrange(mapas_test$prob, mapas_test$accuracy, ncol = 2)
+```
+
+
+Evaluemos cuánto mejora la performance de los modelos si los entrenamos con todas las variables disponibles.
+
+```{r}
+# Definimos cantidad de árboles a probar
+ntrees_valores <- c(50, 100, 200, 300, 400, 500)
+
+
+modelos_rf <- list()
+metricas_por_ntrees <- data.frame()
+errores_oob <- data.frame()
+predicciones_por_modelo <- list()
+
+set.seed(123)  # Para reproducibilidad
+
+
+# Entrenamos 
+for (i in seq_along(ntrees_valores)) {
+  ntree_actual <- ntrees_valores[i]
+  
+  
+  # Entrenar modelo
+  modelo <- randomForest(factor(tipo) ~ ., 
+                        data = Train,
+                        ntree = ntree_actual,
+                        mtry = 2,
+                        importance = TRUE,
+                        do.trace = FALSE)
+  
+  modelos_rf[[as.character(ntree_actual)]] <- modelo
+  
+  # Almacenar error OOB
+  errores_oob <- rbind(errores_oob,
+                      data.frame(ntrees = ntree_actual,
+                                error_oob = modelo$err.rate[ntree_actual, "OOB"]))
+  
+}
+
+# Evaluamos cada modelo
+for (i in seq_along(ntrees_valores)) {
+  ntree_actual <- ntrees_valores[i]
+  modelo <- modelos_rf[[as.character(ntree_actual)]]
+  
+  # Predicciones en Test
+  pred_prob <- predict(modelo, Test, type = "prob")[,2]
+  pred_class <- as.numeric(as.character(predict(modelo, Test, type = "class")))
+  
+  # Calcular métricas
+  tabla_confusion <- table(Observado = Test$tipo, Predicho = pred_class)
+  
+  accuracy <- sum(diag(tabla_confusion)) / sum(tabla_confusion)
+  precision <- ifelse(sum(tabla_confusion[,2]) > 0, 
+                     tabla_confusion[2,2] / sum(tabla_confusion[,2]), 0)
+  recall <- ifelse(sum(tabla_confusion[2,]) > 0, 
+                  tabla_confusion[2,2] / sum(tabla_confusion[2,]), 0)
+  f1 <- ifelse((precision + recall) > 0, 
+              2 * precision * recall / (precision + recall), 0)
+  roc_obj <- roc(Test$tipo, pred_prob, quiet = TRUE)
+  auc_value <- auc(roc_obj)
+  # Almacenar métricas
+  metricas_por_ntrees <- rbind(metricas_por_ntrees,
+                              data.frame(ntrees = ntree_actual,
+                                        accuracy = accuracy,
+                                        precision = precision,
+                                        recall = recall,
+                                        f1_score = f1,
+                                        auc_roc = auc_value))
+  
+  # Almacenar predicciones para análisis posterior
+  predicciones_por_modelo[[as.character(ntree_actual)]] <- list(
+    prob = pred_prob,
+    class = pred_class
+  )
+}
+
+
+# Graficamos el error OOB
+grafico_oob <- ggplot(errores_oob, aes(x = ntrees, y = error_oob)) +
+  geom_line(color = "red", size = 1.2) +
+  geom_point(color = "darkred", size = 3) +
+  geom_text(aes(label = round(error_oob, 3)), 
+            vjust = -0.5, hjust = 0.5, size = 3) +
+  theme_minimal() +
+  labs(title = "Error Out-of-Bag vs Número de Árboles",
+       x = "Número de Árboles",
+       y = "Error OOB") +
+  scale_x_continuous(breaks = ntrees_valores)
+
+# Graficamos métricas
+metricas_long <- metricas_por_ntrees %>%
+  tidyr::pivot_longer(cols = c(accuracy, precision, recall, f1_score),
+                      names_to = "metrica", values_to = "valor")
+
+grafico_metricas <- ggplot(metricas_long, aes(x = ntrees, y = valor, color = metrica)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(title = "Métricas en Conjunto Test vs Número de Árboles",
+       x = "Número de Árboles",
+       y = "Valor de la Métrica",
+       color = "Métrica") +
+  scale_x_continuous(breaks = ntrees_valores) +
+  scale_y_continuous(limits = c(0, 1)) +
+  theme(legend.position = "bottom")
+
+
+# Mostrar gráficos
+
+print(grafico_oob)
+print(grafico_metricas)
+tabla_resumen <- merge(tiempos_entrenamiento, errores_oob, by = "ntrees")
+tabla_resumen <- merge(tabla_resumen, metricas_por_ntrees, by = "ntrees")
+
+# Formatear tabla para mostrar
+tabla_mostrar <- tabla_resumen %>%
+  mutate(
+  
+    error_oob = round(error_oob, 4),
+    accuracy = round(accuracy, 3),
+    precision = round(precision, 3),
+    recall = round(recall, 3),
+    f1_score = round(f1_score, 3),
+    auc_roc = round(auc_roc, 3)
+  ) %>%
+  dplyr::select(ntrees, error_oob, accuracy, precision, recall, f1_score, auc_roc)
+
+print(tabla_mostrar)
+
+
+# Recomendar número óptimo de árboles
+mejor_f1_idx <- which.max(metricas_por_ntrees$f1_score)
+mejor_ntrees_f1 <- ntrees_valores[mejor_f1_idx]
+mejor_f1 <- max(metricas_por_ntrees$f1_score)
+
+mejor_accuracy_idx <- which.max(metricas_por_ntrees$accuracy)
+mejor_ntrees_accuracy <- ntrees_valores[mejor_accuracy_idx]
+mejor_accuracy <- max(metricas_por_ntrees$accuracy)
+
+mejor_aucroc_idx <- which.max(metricas_por_ntrees$auc_roc)
+mejor_ntrees_aucroc <- ntrees_valores[mejor_aucroc_idx]
+mejor_aucroc <- max(metricas_por_ntrees$auc_roc)
+
+
+cat("Mejor F1-Score:", mejor_ntrees_f1, "árboles (F1 =", round(mejor_f1, 3), ")\n")
+cat("Mejor Accuracy:", mejor_ntrees_accuracy, "árboles (Acc =", round(mejor_accuracy, 3), ")\n")
+cat("Mejor AUC-ROC:", mejor_ntrees_aucroc, "árboles (F1 =", round(mejor_aucroc, 3), ")\n")
+```
+
+
+
+```{r}
+# Definir grid de parámetros
+nrounds_grid <- seq(50, 100, by = 10)  # 50, 60, 70, 80, 90, 100
+eta_grid <- c(0.1, 0.2, 0.3)
+max_depth_fijo <- 6
+
+# Crear grid completo de combinaciones
+param_grid <- expand.grid(
+  nrounds = nrounds_grid,
+  eta = eta_grid,
+  max_depth = max_depth_fijo,
+  stringsAsFactors = FALSE
+)
+
+Train_xgb_debug <- preparar_para_xgboost(Train)
+
+vars_problematicas <- sapply(Train_xgb_debug, function(x) !is.numeric(x) && names(Train_xgb_debug) != "tipo")
+
+preparar_para_xgboost_robusto <- function(data) {
+  data_prep <- data
+  
+  # Convertir TODAS las variables (excepto tipo) a numéricas
+  for (col in names(data_prep)) {
+    if (col != "tipo") {  
+      if (is.character(data_prep[[col]])) {
+        # Para character: convertir a factor primero, luego a numérico
+        data_prep[[col]] <- as.numeric(as.factor(data_prep[[col]]))
+      } else if (is.factor(data_prep[[col]])) {
+        # Para factor: convertir directamente a numérico
+        data_prep[[col]] <- as.numeric(data_prep[[col]])
+      } else if (is.logical(data_prep[[col]])) {
+        # Para logical: convertir a 0/1
+        data_prep[[col]] <- as.numeric(data_prep[[col]])
+      } else if (!is.numeric(data_prep[[col]])) {
+        # Para cualquier otro tipo: forzar a numérico
+        data_prep[[col]] <- as.numeric(as.character(data_prep[[col]]))
+      }
       
-      combinacion_actual <- combinacion_actual + 1
-    
-      
-      # Medir tiempo de entrenamiento
-      tiempo_inicio <- Sys.time()
-      # Parámetros del modelo
-        params <- list(
-          objective = "binary:logistic",
-          eval_metric = "auc",
-          max_depth = max_depth_fijo,
-          eta = eta,
-          subsample = 0.8,
-          colsample_bytree = 0.8,
-          verbosity = 0  # Silenciar output
-        )
-        
-        # Entrenar modelo
-        modelo_xgb <- xgb.train(
-          params = params,
-          data = dtrain,
-          nrounds = nrounds,
-          watchlist = list(train = dtrain, test = dtest),
-          verbose = 0,  # Silenciar output
-          early_stopping_rounds = 10,
-          print_every_n = 0  # No imprimir progreso
-        )
-        
-        tiempo_fin <- Sys.time()
-        tiempo_entrenamiento <- as.numeric(difftime(tiempo_fin, tiempo_inicio, units = "secs"))
-        
-        # Predicciones en test
-        pred_prob <- predict(modelo_xgb, dtest)
-        pred_class <- factor(ifelse(pred_prob > 0.5, "1", "0"), levels = c("0", "1"))
-        
-        # Métricas de evaluación
-        cm <- confusionMatrix(pred_class, test_df$tiene_delito, positive = "1")
-        
-        # AUC-ROC
-        roc_obj <- roc(test_df$tiene_delito, pred_prob, quiet = TRUE)
-        auc_val <- auc(roc_obj)
-        
-        # AUC en train (para verificar overfitting)
-        pred_prob_train <- predict(modelo_xgb, dtrain)
-        roc_train <- roc(train_df$tiene_delito, pred_prob_train, quiet = TRUE)
-        auc_train <- auc(roc_train)
-        
-        # Guardar resultados
-        resultados_grid <- rbind(resultados_grid, data.frame(
-          nrounds = nrounds,
-          eta = eta,
-          max_depth = max_depth_fijo,
-          auc = as.numeric(auc_val),
-          accuracy = as.numeric(cm$overall["Accuracy"]),
-          sensitivity = as.numeric(cm$byClass["Sensitivity"]),
-          specificity = as.numeric(cm$byClass["Specificity"]),
-          precision = as.numeric(cm$byClass["Pos Pred Value"]),
-          train_auc = as.numeric(auc_train),
-          test_auc = as.numeric(auc_val),
-          tiempo_entrenamiento = tiempo_entrenamiento
-        ))
-        
-       
-        
-        # Verificar si es el mejor modelo hasta ahora
-        if(auc_val > mejor_auc) {
-          mejor_auc <- auc_val
-          mejor_modelo <- modelo_xgb
-          mejor_config <- list(nrounds = nrounds, eta = eta, max_depth = max_depth_fijo)
-          mejor_predicciones <- list(
-            prob = pred_prob,
-            class = pred_class,
-            roc = roc_obj,
-            cm = cm
-          )
-          mejor_matrices <- list(
-            train_matrix = train_matrix,
-            test_matrix = test_matrix
-          )
-         
-        }
-       
+      # Reemplazar NAs con 0 si se generaron durante la conversión
+      data_prep[[col]][is.na(data_prep[[col]])] <- 0
     }
   }
   
+  return(data_prep)
+}
+
+Train_xgb <- preparar_para_xgboost_robusto(Train)
+Test_xgb <- preparar_para_xgboost_robusto(Test)
+Validation_xgb <- preparar_para_xgboost_robusto(Validation)
+preTrain_xgb <- preparar_para_xgboost_robusto(preTrain)
+
+tipos_train <- sapply(Train_xgb[, setdiff(names(Train_xgb), "tipo")], class)
+
+vars_no_numericas <- names(tipos_train)[tipos_train != "numeric" & tipos_train != "integer"]
+if(length(vars_no_numericas) > 0) {
+  cat("Variables que AÚN no son numéricas:\n")
+  print(vars_no_numericas)
   
-  # Ordenar resultados por AUC
-  resultados_grid <- resultados_grid[order(-resultados_grid$auc, na.last = TRUE), ]
-  
-  
-  # Información del mejor modelo
-  cat("\n=== MEJOR MODELO ENCONTRADO ===\n")
-  cat("Configuración: nrounds =", mejor_config$nrounds, 
-      ", eta =", mejor_config$eta, 
-      ", max_depth =", mejor_config$max_depth, "\n")
-  cat("AUC-ROC:", round(mejor_auc, 4), "\n")
-  
-  # Métricas detalladas del mejor modelo
-  
-  cat("\nMatriz de Confusión:\n")
-  cm_table <- mejor_predicciones$cm$table
-  print(cm_table)
-  cat("Accuracy: ", round(mejor_predicciones$cm$overall["Accuracy"], 4), "\n")
-  cat("Precision:", round(mejor_predicciones$cm$byClass["Pos Pred Value"], 4), "\n") 
-  cat("Recall:   ", round(mejor_predicciones$cm$byClass["Recall"], 4), "\n")
-  
-  # Importancia de variables del mejor modelo
-  importancia <- xgb.importance(colnames(mejor_matrices$train_matrix), model = mejor_modelo)
-  
-  # Visualizaciones del mejor modelo
-  # ROC Curve
-  plot(mejor_predicciones$roc, 
-       main = paste("Curva ROC - Mejor XGBoost", tipo_delito, 
-                   "\n(nrounds =", mejor_config$nrounds, 
-                   ", eta =", mejor_config$eta, ")"),
-       col = "purple", lwd = 2)
-  legend("bottomright", paste("AUC =", round(mejor_auc, 4)), cex = 1.2)
-  
-  # Variable Importance Plot
-  xgb.plot.importance(importancia, 
-                     main = paste("Importancia Variables - Mejor XGBoost", tipo_delito,
-                                 "\n(nrounds =", mejor_config$nrounds, 
-                                 ", eta =", mejor_config$eta, ")"))
-  
-  
-  # Preparar datos de test con predicciones para visualización espacial
-  test_sf$pred_prob <- mejor_predicciones$prob
-  test_sf$pred_class <- mejor_predicciones$class
-  
-  # Visualización espacial
-  p1 <- ggplot(test_sf) +
+  # Forzar manualmente estas variables
+  for(var in vars_no_numericas) {
+    cat("Forzando", var, "a numérico...\n")
+    Train_xgb[[var]] <- as.numeric(as.character(Train_xgb[[var]]))
+    Test_xgb[[var]] <- as.numeric(as.character(Test_xgb[[var]]))
+    Validation_xgb[[var]] <- as.numeric(as.character(Validation_xgb[[var]]))
     
-    geom_sf(aes(fill = as.numeric(as.character(tiene_delito))), color = NA) +
-    geom_sf(data = calles_hs, color = "gray80", size = 0.2) +
-    scale_fill_gradient(low = "white", high = "red", name = "Delitos\nReales") +
-    ggtitle(paste("Delitos Reales -", tipo_delito, "(Cell size: 50m)")) +
-    theme_minimal()
+    # Reemplazar NAs con 0
+    Train_xgb[[var]][is.na(Train_xgb[[var]])] <- 0
+    Test_xgb[[var]][is.na(Test_xgb[[var]])] <- 0
+    Validation_xgb[[var]][is.na(Validation_xgb[[var]])] <- 0
+  }
+}
+
+
+variables_predictoras <- setdiff(names(Train_xgb), "tipo")
+
+
+dtrain <- xgb.DMatrix(data = as.matrix(Train_xgb[, variables_predictoras]), 
+                      label = Train_xgb$tipo)
+dtest <- xgb.DMatrix(data = as.matrix(Test_xgb[, variables_predictoras]), 
+                     label = Test_xgb$tipo)
+dvalidation <- xgb.DMatrix(data = as.matrix(Validation_xgb[, variables_predictoras]), 
+                          label = Validation_xgb$tipo)
+
+dpreTrain <- xgb.DMatrix(data = as.matrix(preTrain_xgb[, variables_predictoras]), 
+                          label = preTrain_xgb$tipo)
+
+# Inicializar estructuras para almacenar resultados
+modelos_xgb <- list()
+resultados_grid <- data.frame()
+predicciones_por_modelo <- list()
+
+set.seed(123)  # Para reproducibilidad
+
+# Entrenamos modelos
+
+for (i in 1:nrow(param_grid)) {
+  params <- param_grid[i, ]
+  nrounds_actual <- params$nrounds
+  eta_actual <- params$eta
+  max_depth_actual <- params$max_depth
   
-  p2 <- ggplot(test_sf) +
-    geom_sf(aes(fill = pred_prob), color = NA) +
-    geom_sf(data = calles_hs, color = "gray80", size = 0.2) +
-    scale_fill_gradient(low = "white", high = "purple", name = "Prob.\nPredicha") +
-    ggtitle(paste("Probabilidades Predichas - Mejor XGBoost", tipo_delito,
-                  "\n(nrounds =", mejor_config$nrounds, 
-                  ", eta =", mejor_config$eta, ")")) +
+  combo_name <- paste0("nr", nrounds_actual, "_eta", eta_actual, "_md", max_depth_actual)
+
+ 
   
-    theme_minimal()
+  # Parámetros del modelo
+  params_xgb <- list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    eta = eta_actual,
+    max_depth = max_depth_actual,
+    subsample = 0.8,
+    colsample_bytree = 1.0,
+    seed = 123
+  )
   
-  print(p1)
-  print(p2)
+  # Entrenar modelo
+  modelo <- xgb.train(
+    params = params_xgb,
+    data = dtrain,
+    nrounds = nrounds_actual,
+    watchlist = list(train = dtrain, eval = dtest),
+    verbose = 0,
+    early_stopping_rounds = 10
+  )
   
-  # Retornar resultados completos
-  return(list(
-    mejor_modelo = mejor_modelo,
-    mejor_config = mejor_config,
-    mejor_auc = mejor_auc,
-    mejor_predicciones = mejor_predicciones,
-    mejor_matrices = mejor_matrices,
-    resultados_completos = resultados_grid,
-    train_data = train_sf,
-    test_data = test_sf,
-    importancia = importancia
+ 
+  
+  # Almacenar modelo
+  modelos_xgb[[combo_name]] <- modelo
+  
+  # Hacer predicciones en Test
+  pred_prob <- predict(modelo, dtest)
+  pred_class <- ifelse(pred_prob > 0.5, 1, 0)
+  
+  # Calcular métricas
+  tabla_confusion <- table(Observado = Test$tipo, Predicho = pred_class)
+  
+  accuracy <- sum(diag(tabla_confusion)) / sum(tabla_confusion)
+  precision <- ifelse(sum(tabla_confusion[,2]) > 0, 
+                     tabla_confusion[2,2] / sum(tabla_confusion[,2]), 0)
+  recall <- ifelse(sum(tabla_confusion[2,]) > 0, 
+                  tabla_confusion[2,2] / sum(tabla_confusion[2,]), 0)
+  f1 <- ifelse((precision + recall) > 0, 
+              2 * precision * recall / (precision + recall), 0)
+  
+  roc_obj <- roc(Test$tipo, pred_prob, quiet = TRUE)
+  auc_value <- auc(roc_obj)
+  # Obtener error de entrenamiento final
+  train_error <- modelo$evaluation_log$train_logloss[nrow(modelo$evaluation_log)]
+  eval_error <- modelo$evaluation_log$eval_logloss[nrow(modelo$evaluation_log)]
+  
+  # Almacenar resultados
+  resultados_grid <- rbind(resultados_grid, data.frame(
+    combo = combo_name,
+    nrounds = nrounds_actual,
+    eta = eta_actual,
+    max_depth = max_depth_actual,
+    tiempo_seg = tiempo_transcurrido,
+    train_logloss = train_error,
+    eval_logloss = eval_error,
+    accuracy = accuracy,
+    precision = precision,
+    recall = recall,
+    f1_score = f1,
+    auc_roc = auc_value,
+    stringsAsFactors = FALSE
   ))
+  
+  # Almacenar predicciones para análisis posterior
+  predicciones_por_modelo[[combo_name]] <- list(
+    prob = pred_prob,
+    class = pred_class
+  )
+
 }
 
-
-resultado_xgb_grid_hurto <- explorar_hiperparametros_xgb(Train, Test, "Hurto", columna_delito = "tipo")
-resultado_xgb_grid_robo <- explorar_hiperparametros_xgb(Train, Test, "Robo", columna_delito = "tipo")
-
-# Resumen final comparativo
-cat("\n=== RESUMEN FINAL DE MEJORES MODELOS XGBOOST ===\n")
-cat("TIPO DELITO\t\tMEJOR CONFIG\t\t\t\tAUC\n")
-cat("-------------------------------------------------------------------\n")
-
-cat("HURTO\t\t\tnrounds =", resultado_xgb_grid_hurto$mejor_config$nrounds, 
-    ", eta =", resultado_xgb_grid_hurto$mejor_config$eta, 
-    "\t\t", round(resultado_xgb_grid_hurto$mejor_auc, 4), "\n")
+# Elegimos el mejor modelo 
 
 
+# Encontrar mejores modelos
+mejor_f1_idx <- which.max(resultados_grid$f1_score)
+mejor_accuracy_idx <- which.max(resultados_grid$accuracy)
+mejor_precision_idx <- which.max(resultados_grid$precision)
+mejor_recall_idx <- which.max(resultados_grid$recall)
+mejor_aucroc_idx <- which.max(resultados_grid$auc_roc)
 
-cat("ROBO\t\t\tnrounds =", resultado_xgb_grid_robo$mejor_config$nrounds, 
-    ", eta =", resultado_xgb_grid_robo$mejor_config$eta, 
-    "\t\t", round(resultado_xgb_grid_robo$mejor_auc, 4), "\n")
+cat("Mejor F1-Score:", round(resultados_grid$f1_score[mejor_f1_idx], 3), 
+    "| Combo:", resultados_grid$combo[mejor_f1_idx], "\n")
+cat("Mejor Accuracy:", round(resultados_grid$accuracy[mejor_accuracy_idx], 3), 
+    "| Combo:", resultados_grid$combo[mejor_accuracy_idx], "\n")
+cat("Mejor Precision:", round(resultados_grid$precision[mejor_precision_idx], 3), 
+    "| Combo:", resultados_grid$combo[mejor_precision_idx], "\n")
+cat("Mejor Recall:", round(resultados_grid$recall[mejor_recall_idx], 3), 
+    "| Combo:", resultados_grid$combo[mejor_recall_idx], "\n")
+cat("Mejor AUC-ROC:", round(resultados_grid$auc_roc[mejor_aucroc_idx], 3), 
+    "| Combo:", resultados_grid$combo[mejor_aucroc_idx], "\n\n")
+
+
+# Seleccionar top 3 modelos
+mejor_modelo <- resultados_grid[order(resultados_grid$auc_roc, decreasing = TRUE)[1], ]
+combo_name <- mejor_modelo$combo
+  
+# Obtener predicciones
+pred_prob <- predicciones_por_modelo[[combo_name]]$prob
+pred_class <- predicciones_por_modelo[[combo_name]]$class
+  
+# Crear shapefile para Test
+datos_sf <- Test %>%
+mutate(
+  pred_prob_xgb = pred_prob,
+  pred_class_xgb = pred_class,
+  combo = combo_name,
+  tipo_real = factor(tipo, levels = c(0, 1), labels = c("Hurto", "Robo")),
+  tipo_pred_xgb = factor(pred_class_xgb, levels = c(0, 1), labels = c("Hurto", "Robo")),
+  correcta_xgb = ifelse(tipo == pred_class_xgb, "Correcta", "Incorrecta")
+) %>%
+st_as_sf(coords = c("longitud", "latitud"), crs = 4326)
+
+pred_data <- data.frame(
+  longitud = Test$longitud,
+  latitud = Test$latitud,
+  prob_robo = predicciones_por_modelo[[combo_name]]$prob,
+  tipo_real = factor(Test$tipo, levels = c(0, 1), labels = c("Hurto", "Robo"))
+)
+
+
+
+tabla_resumen_xgb <- resultados_grid %>%
+  mutate(
+    eval_logloss = round(eval_logloss, 4),
+    accuracy = round(accuracy, 3),
+    precision = round(precision, 3),
+    recall = round(recall, 3),
+    f1_score = round(f1_score, 3),
+    auc_roc = round(auc_roc, 4)
+  ) %>%
+  arrange(desc(auc_roc))
+
+print(tabla_resumen_xgb)
+
+mejor_modelo <- resultados_grid[mejor_aucroc_idx, ]
+
+cat("Combinación:", mejor_modelo$combo, "\n")
+cat("nrounds =", mejor_modelo$nrounds, "| eta =", mejor_modelo$eta, 
+    "| max_depth =", mejor_modelo$max_depth, "\n")
+cat("F1-Score:", round(mejor_modelo$f1_score, 3), "\n")
+cat("AUC-ROC:", round(mejor_modelo$auc_roc, 3), "\n")
+```
+
+
+Ahora que elegimos los mejores modelos comparemos resultados.
+
+
+```{r}
+# Entrenar el modelo de regresión logística
+modelo_logistico <- glm(tipo ~ ., 
+                       data = Train, 
+                       family = binomial())
+
+# Ver resumen del modelo
+summary(modelo_logistico)
+
+# Predecimos las respuestas
+pred_train_prob <- predict(modelo_logistico, Train, type = "response")
+pred_test_prob <- predict(modelo_logistico, Test, type = "response")
+
+# Binarizamos
+pred_train_class <- ifelse(pred_train_prob > 0.5, 1, 0)
+pred_test_class <- ifelse(pred_test_prob > 0.5, 1, 0)
+
+# Evaluar en todos los conjuntos
+metricas_train <- calcular_metricas(Train$tipo, pred_train_class, pred_train_prob, "TRAIN")
+metricas_test <- calcular_metricas(Test$tipo, pred_test_class,pred_test_prob ,"TEST")
+
+shapefile_train <- crear_shapefile(Train, pred_train_prob, pred_train_class, "Train")
+shapefile_test <- crear_shapefile(Test, pred_test_prob, pred_test_class, "Test")
+
+mapas_train <- crear_mapa_comparativo(shapefile_train, "TRAIN")
+mapas_test <- crear_mapa_comparativo(shapefile_test, "TEST")
+
+
+grid.arrange(mapas_train$real, mapas_train$pred, ncol = 2)
+grid.arrange(mapas_test$real, mapas_test$pred, ncol = 2)
+grid.arrange(mapas_train$prob, mapas_train$accuracy, ncol = 2)
+grid.arrange(mapas_test$prob, mapas_test$accuracy, ncol = 2)
+
+
+# Estadísticas del Train
+cat("=== ESTADÍSTICAS SHAPEFILE TRAIN ===\n")
+cat("Total puntos:", nrow(shapefile_train), "\n")
+cat("Predicciones correctas:", sum(shapefile_train$correcta == "Correcta"), "\n")
+cat("Accuracy:", round(mean(shapefile_train$correcta == "Correcta"), 3), "\n")
+cat("Distribución real - Hurtos:", sum(shapefile_train$tipo == 0), "| Robos:", sum(shapefile_train$tipo == 1), "\n")
+cat("Distribución pred - Hurtos:", sum(shapefile_train$pred_class == 0), "| Robos:", sum(shapefile_train$pred_class == 1), "\n\n")
+
+# Estadísticas del Test
+cat("=== ESTADÍSTICAS SHAPEFILE TEST ===\n")
+cat("Total puntos:", nrow(shapefile_test), "\n")
+cat("Predicciones correctas:", sum(shapefile_test$correcta == "Correcta"), "\n")
+cat("Accuracy:", round(mean(shapefile_test$correcta == "Correcta"), 3), "\n")
+cat("Distribución real - Hurtos:", sum(shapefile_test$tipo == 0), "| Robos:", sum(shapefile_test$tipo == 1), "\n")
+cat("Distribución pred - Hurtos:", sum(shapefile_test$pred_class == 0), "| Robos:", sum(shapefile_test$pred_class == 1), "\n\n")
 
 ```
 
-Validemos para ver cuál es la mejor configuración para cada modelo. Para ello entrenaremos con Pretrain y validaremos con Validation. El split en Train-Test fue para la exploración de hiperparámetros y evitar data leakage.
+```{r}
+modelo <- randomForest(factor(tipo) ~ ., 
+                        data = Train,
+                        ntree = 300,
+                        mtry = 2,
+                        importance = TRUE,
+                        do.trace = FALSE)
+
+pred_train_prob<- predict(modelo, Train, type = "prob")[,2]
+pred_train_class <- as.numeric(as.character(predict(modelo, Train, type = "class")))
+
+pred_test_prob <- predict(modelo, Test, type = "prob")[,2]
+pred_test_class <- as.numeric(as.character(predict(modelo, Test, type = "class")))
+
+shapefile_train <- crear_shapefile(Train, pred_train_prob, pred_train_class, "Train")
+shapefile_test <- crear_shapefile(Test, pred_test_prob, pred_test_class, "Test")
+
+
+mapas_train <- crear_mapa_comparativo(shapefile_train, "TRAIN")
+mapas_test <- crear_mapa_comparativo(shapefile_test, "TEST")
+
+plot(roc(Train$tipo, pred_train_prob, quiet = TRUE), 
+     main = paste("Curva ROC en Train") , 
+     col = "blue", 
+     lwd = 2,
+     print.auc = TRUE)
+
+plot(roc(Test$tipo, pred_test_prob, quiet = TRUE), 
+   main = paste("Curva ROC en Test") , 
+   col = "blue", 
+   lwd = 2,
+   print.auc = TRUE)
+
+grid.arrange(mapas_train$real, mapas_train$pred, ncol = 2)
+grid.arrange(mapas_test$real, mapas_test$pred, ncol = 2)
+grid.arrange(mapas_train$prob, mapas_train$accuracy, ncol = 2)
+grid.arrange(mapas_test$prob, mapas_test$accuracy, ncol = 2)
+```
+
 
 ```{r}
-entrenar_evaluar_randomforest <- function(train_data, test_data, tipo_delito, columna_delito, cell_size, ntree, mtry) {
-  
-  # Crear datasets
-  train_sf <- crear_dataset_espacial_optimizado(train_data, tipo_delito, columna_delito, cell_size)
-  test_sf <- crear_dataset_espacial_optimizado(test_data, tipo_delito, columna_delito, cell_size)
-  
-  # Convertir a dataframe
-  train_df <- train_sf %>%
-    st_drop_geometry() %>%
-    dplyr::select(tiene_delito, x_norm, y_norm, dist_centro_norm, 
-                  densidad_local_norm, cuadrante)
-  
-  test_df <- test_sf %>%
-    st_drop_geometry() %>%
-    dplyr::select(tiene_delito, x_norm, y_norm, dist_centro_norm, 
-                  densidad_local_norm, cuadrante)
-  
-  # Entrenar modelo Random Forest
-  modelo_rf <- randomForest(
-    tiene_delito ~ x_norm + y_norm + dist_centro_norm + densidad_local_norm + cuadrante,
-    data = train_df,
-    ntree = ntree,           
-    mtry = mtry,              
-    importance = TRUE,     
-    do.trace = FALSE       
+params_xgb <- list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    eta = 0.3,
+    max_depth = 6,
+    subsample = 0.8,
+    colsample_bytree = 1.0,
+    seed = 123
   )
-  
-  # Predicciones (probabilidades)
-  pred_prob <- predict(modelo_rf, test_df, type = "prob")[, "1"]
-  
-  # Calcular AUC
-  roc_obj <- roc(test_df$tiene_delito, pred_prob, quiet = TRUE)
-  auc_val <- as.numeric(auc(roc_obj))
-  
-  # Métricas adicionales
-  pred_class <- factor(ifelse(pred_prob > 0.5, "1", "0"), levels = c("0", "1"))
-  cm <- confusionMatrix(pred_class, test_df$tiene_delito, positive = "1")
-  
-  # Importancia de variables
-  importancia <- importance(modelo_rf)
-  importancia_df <- data.frame(
-    Variable = rownames(importancia),
-    MeanDecreaseAccuracy = importancia[, "MeanDecreaseAccuracy"],
-    MeanDecreaseGini = importancia[, "MeanDecreaseGini"]
+
+modelo <- xgb.train(
+  params = params_xgb,
+  data = dtrain,
+  nrounds = 60,
+  watchlist = list(train = dtrain, eval = dtest),
+  verbose = 0,
+  early_stopping_rounds = 10
+)
+
+
+pred_train_prob <- predict(modelo, dtrain)
+pred_train_class <- ifelse(pred_train_prob > 0.5, 1, 0)
+
+pred_test_prob <- predict(modelo, dtest)
+pred_test_class <- ifelse(pred_test_prob > 0.5, 1, 0)
+
+
+
+shapefile_train <- crear_shapefile(Train, pred_train_prob, pred_train_class, "Train")
+shapefile_test <- crear_shapefile(Test, pred_test_prob, pred_test_class, "Test")
+
+
+mapas_train <- crear_mapa_comparativo(shapefile_train, "TRAIN")
+mapas_test <- crear_mapa_comparativo(shapefile_test, "TEST")
+
+plot(roc(Train$tipo, pred_train_prob, quiet = TRUE), 
+     main = paste("Curva ROC en Train") , 
+     col = "blue", 
+     lwd = 2,
+     print.auc = TRUE)
+
+plot(roc(Test$tipo, pred_test_prob, quiet = TRUE), 
+   main = paste("Curva ROC en Test") , 
+   col = "blue", 
+   lwd = 2,
+   print.auc = TRUE)
+
+grid.arrange(mapas_train$real, mapas_train$pred, ncol = 2)
+grid.arrange(mapas_test$real, mapas_test$pred, ncol = 2)
+grid.arrange(mapas_train$prob, mapas_train$accuracy, ncol = 2)
+grid.arrange(mapas_test$prob, mapas_test$accuracy, ncol = 2)
+```
+
+
+Ahora que tenemos definidas las mejores configuraciones, determinemos con validación cuál es el mejor de estos tres modelos. Para determinar esto utilizaremos el AUC-ROC.
+
+```{r}
+modelo_logistico <- glm(tipo ~ ., 
+                       data = preTrain, 
+                       family = binomial())
+
+# Predecimos las respuestas
+pred_Validation_prob <- predict(modelo_logistico, Validation, type = "response")
+
+# Binarizamos
+pred_Validation_class <- ifelse(pred_Validation_prob > 0.5, 1, 0)
+
+
+# Evaluar en todos los conjuntos
+metricas_Validation <- calcular_metricas(Validation$tipo, pred_Validation_class,pred_Validation_prob ,"Validation")
+
+shapefile_Validation <- crear_shapefile(Validation, pred_Validation_prob, pred_Validation_class, "Validation")
+
+mapas_Validation <- crear_mapa_comparativo(shapefile_Validation, "VALIDATION")
+
+grid.arrange(mapas_Validation$real, mapas_Validation$pred, ncol = 2)
+grid.arrange(mapas_Validation$prob, mapas_Validation$accuracy, ncol = 2)
+
+# Estadísticas del Test
+cat("Total puntos:", nrow(shapefile_Validation), "\n")
+cat("Predicciones correctas:", sum(shapefile_Validation$correcta == "Correcta"), "\n")
+cat("Accuracy:", round(mean(shapefile_Validation$correcta == "Correcta"), 3), "\n")
+cat("Distribución real - Hurtos:", sum(shapefile_Validation$tipo == 0), "| Robos:", sum(shapefile_Validation$tipo == 1), "\n")
+cat("Distribución pred - Hurtos:", sum(shapefile_Validation$pred_class == 0), "| Robos:", sum(shapefile_Validation$pred_class == 1), "\n\n")
+```
+
+
+```{r}
+modelo <- randomForest(factor(tipo) ~ ., 
+                        data = preTrain,
+                        ntree = 300,
+                        mtry = 2,
+                        importance = TRUE,
+                        do.trace = FALSE)
+
+pred_Validation_prob <- predict(modelo, Validation, type = "prob")[,2]
+pred_Validation_class <- as.numeric(as.character(predict(modelo, Validation, type = "class")))
+shapefile_Validation <- crear_shapefile(Validation, pred_Validation_prob, pred_Validation_class, "VALIDATION")
+mapas_Validation <- crear_mapa_comparativo(shapefile_Validation, "VALIDATION")
+
+plot(roc(Validation$tipo, pred_Validation_prob, quiet = TRUE), 
+   main = paste("Curva ROC en VALIDATION") , 
+   col = "blue", 
+   lwd = 2,
+   print.auc = TRUE)
+
+grid.arrange(mapas_Validation$real, mapas_Validation$pred, ncol = 2)
+grid.arrange(mapas_Validation$prob, mapas_Validation$accuracy, ncol = 2)
+```
+
+```{r}
+
+params_xgb <- list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    eta = 0.3,
+    max_depth = 6,
+    subsample = 0.8,
+    colsample_bytree = 1.0,
+    seed = 123
   )
-  p1 <- ggplot(test_sf) +
-    geom_sf(aes(fill = as.numeric(as.character(tiene_delito))), color = NA) +
-    geom_sf(data = calles_hs, color = "gray80", size = 0.2) +
-    scale_fill_gradient(low = "white", high = "red", name = "Delitos\nReales") +
-    ggtitle(paste("Delitos Reales -", tipo_delito, "(Cell size: 50m)")) +
-        theme_minimal() +
-    theme(
-      axis.text = element_blank(),
-      axis.ticks = element_blank(),
-      panel.grid = element_blank(),
-      legend.position = "right",
-      plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
-    )
 
-  
-  
-  p2 <- ggplot(test_sf) +
-  geom_sf(aes(fill = pred_prob), color = NA) +
-  geom_sf(data = calles_hs, color = "gray80", size = 0.2) +
-  scale_fill_gradient(low = "white", high = "darkgreen", name = "Prob.\nPredicha") +
-  ggtitle(paste("Probabilidades Predichas - Mejor RF", tipo_delito,
-                "\n(ntree =", modelo_rf$ntree, ", mtry =", modelo_rf$mtry, ")"))+
-        theme_minimal() +
-    theme(
-      axis.text = element_blank(),
-      axis.ticks = element_blank(),
-      panel.grid = element_blank(),
-      legend.position = "right",
-      plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
-    )
+modelo <- xgb.train(
+  params = params_xgb,
+  data = dpreTrain,
+  nrounds = 60,
+  watchlist = list(train = dpreTrain, eval = dvalidation),
+  verbose = 0,
+  early_stopping_rounds = 10
+)
 
-  
-  
-  return(list(
-    auc = auc_val,
-    accuracy = cm$overall["Accuracy"],
-    sensitivity = cm$byClass["Sensitivity"],
-    specificity = cm$byClass["Specificity"],
-    precision = cm$byClass["Pos Pred Value"],
-    cell_size = cell_size,
-    n_celdas_train = nrow(train_sf),
-    n_celdas_test = nrow(test_sf),
-    casos_positivos = sum(train_df$tiene_delito == "1"),
-    casos_negativos = sum(train_df$tiene_delito == "0"),
-    modelo = modelo_rf,
-    train_data = train_sf,
-    test_data = test_sf,
-    importancia = importancia_df,
-    oob_error = modelo_rf$err.rate[modelo_rf$ntree, "OOB"],
-    error = NULL,
-    grafico_reales = p1,
-    grafico_probabilidades = p2
-  ))
-}
+pred_validation_prob <- predict(modelo, dvalidation)
+pred_validation_class <- ifelse(pred_validation_prob > 0.5, 1, 0)
+shapefile_validation <- crear_shapefile(Validation, pred_validation_prob, pred_validation_class, "Validation")
+mapas_test <- crear_mapa_comparativo(shapefile_validation, "VALIDATION")
 
+plot(roc(Validation$tipo, pred_validation_prob, quiet = TRUE), 
+   main = paste("Curva ROC en Validation") , 
+   col = "blue", 
+   lwd = 2,
+   print.auc = TRUE)
 
+grid.arrange(mapas_test$real, mapas_test$pred, ncol = 2)
+grid.arrange(mapas_test$prob, mapas_test$accuracy, ncol = 2)
 ```
-
-```{r}
-entrenar_evaluar_xgboost <- function(train_data, test_data, tipo_delito, columna_delito, cell_size, nrounds, eta, max_depth) {
-  
-  # Crear datasets
-  train_sf <- crear_dataset_espacial_optimizado(train_data, tipo_delito, columna_delito, cell_size)
-  test_sf <- crear_dataset_espacial_optimizado(test_data, tipo_delito, columna_delito, cell_size)
-  
-  # Convertir a dataframe
-  train_df <- train_sf %>%
-    st_drop_geometry() %>%
-    dplyr::select(tiene_delito, x_norm, y_norm, dist_centro_norm, 
-                  densidad_local_norm, cuadrante)
-  
-  test_df <- test_sf %>%
-    st_drop_geometry() %>%
-    dplyr::select(tiene_delito, x_norm, y_norm, dist_centro_norm, 
-                  densidad_local_norm, cuadrante)
-  
-  # Preparar datos para XGBoost
-  train_matrix <- model.matrix(tiene_delito ~ . - 1, data = train_df)
-  test_matrix <- model.matrix(tiene_delito ~ . - 1, data = test_df)
-  
-  # Labels (0 y 1)
-  train_labels <- as.numeric(as.character(train_df$tiene_delito))
-  test_labels <- as.numeric(as.character(test_df$tiene_delito))
-  
-  # Crear matrices DMatrix para XGBoost
-  dtrain <- xgb.DMatrix(data = train_matrix, label = train_labels)
-  dtest <- xgb.DMatrix(data = test_matrix, label = test_labels)
-  
-  # Parámetros para XGBoost
-  params <- list(
-          objective = "binary:logistic",
-          eval_metric = "auc",
-          max_depth = max_depth,
-          eta = eta,
-          subsample = 0.8,
-          colsample_bytree = 0.8,
-          verbosity = 0  # Silenciar output
-        )
-  
-  modelo_xgb <- xgb.train(
-    params = params,
-          data = dtrain,
-          nrounds = nrounds,
-          watchlist = list(train = dtrain, test = dtest),
-          verbose = 0,  # Silenciar output
-          early_stopping_rounds = 10,
-          print_every_n = 0  # No imprimir progreso
-  )
-  
-  # Predicciones (probabilidades)
-  pred_prob <- predict(modelo_xgb, dtest)
-  
-  # Calcular AUC
-  roc_obj <- roc(test_df$tiene_delito, pred_prob, quiet = TRUE)
-  auc_val <- as.numeric(auc(roc_obj))
-  
-  # Métricas adicionales
-  pred_class <- factor(ifelse(pred_prob > 0.5, "1", "0"), levels = c("0", "1"))
-  cm <- confusionMatrix(pred_class, test_df$tiene_delito, positive = "1")
-  
-  # Importancia de variables
-  importancia <- xgb.importance(model = modelo_xgb)
-  
-  p1 <- ggplot(test_sf) +
-    geom_sf(aes(fill = as.numeric(as.character(tiene_delito))), color = NA) +
-    geom_sf(data = calles_hs, color = "gray80", size = 0.2) +
-    scale_fill_gradient(low = "white", high = "red", name = "Delitos\nReales") +
-    ggtitle(paste("Delitos Reales -", tipo_delito, "(Cell size: 50m)")) +
-    theme_minimal()+
-    theme(
-      axis.text = element_blank(),
-      axis.ticks = element_blank(),
-      panel.grid = element_blank(),
-      legend.position = "right",
-      plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
-    )
-  
-  p2 <- ggplot(test_sf) +
-    geom_sf(aes(fill = pred_prob), color = NA) +
-    geom_sf(data = calles_hs, color = "gray80", size = 0.2) +
-    scale_fill_gradient(low = "white", high = "purple", name = "Prob.\nPredicha") +
-    ggtitle(paste("Probabilidades Predichas - Mejor XGBoost", tipo_delito,
-                  "\n(nrounds =", modelo_xgb$nrounds, 
-                  ", eta =", modelo_xgb$eta, ")")) +
-  
-    theme_minimal() +
-    theme(
-      axis.text = element_blank(),
-      axis.ticks = element_blank(),
-      panel.grid = element_blank(),
-      legend.position = "right",
-      plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
-    )
-  
-  
-  return(list(
-    auc = auc_val,
-    accuracy = cm$overall["Accuracy"],
-    sensitivity = cm$byClass["Sensitivity"],
-    specificity = cm$byClass["Specificity"],
-    precision = cm$byClass["Pos Pred Value"],
-    cell_size = cell_size,
-    n_celdas_train = nrow(train_sf),
-    n_celdas_test = nrow(test_sf),
-    casos_positivos = sum(train_df$tiene_delito == "1"),
-    casos_negativos = sum(train_df$tiene_delito == "0"),
-    modelo = modelo_xgb,
-    train_data = train_sf,
-    test_data = test_sf,
-    importancia = importancia,
-    nrounds = nrounds,
-    error = NULL,
-    grafico_reales = p1,
-    grafico_probabilidades = p2
-  ))
-}
-```
-
-```{r}
-regLog_final_H = entrenar_evaluar_logistica(preTrain, Validation, "Hurto", "tipo", 50)
-regLog_final_R = entrenar_evaluar_logistica(preTrain, Validation, "Robo", "tipo", 50)
-```
-
-
-```{r}
-RF_final_H = entrenar_evaluar_randomforest(preTrain, Validation, "Hurto", "tipo", 50, 50, 2)
-RF_final_R = entrenar_evaluar_randomforest(preTrain, Validation, "Robo", "tipo", 50, 50, 2)
-```
-
-```{r}
-XG_final_H = entrenar_evaluar_xgboost(preTrain, Validation, "Hurto", "tipo", 50, 50, 0.1,6)
-XG_final_R = entrenar_evaluar_xgboost(preTrain, Validation, "Robo", "tipo", 50, 50, 0.1,6)
-```
-
-
-```{r}
-
-# Función para crear tabla comparativa de modelos
-crear_tabla_comparativa <- function(resultado_logistico, resultado_rf, resultado_xgboost) {
-  
-  # Extraer métricas principales de cada modelo
-  metricas <- data.frame(
-    Metrica = c("AUC", "Accuracy", "Sensitivity", "Specificity", "Precision",
-                "Celdas Train", "Celdas Test", "Casos Positivos", "Casos Negativos"),
-    
-    Regresion_Logistica = c(
-      round(resultado_logistico$auc, 7),
-      round(resultado_logistico$accuracy, 7),
-      round(resultado_logistico$sensitivity, 7),
-      round(resultado_logistico$specificity, 7),
-      round(resultado_logistico$precision, 7),
-      resultado_logistico$n_celdas_train,
-      resultado_logistico$n_celdas_test,
-      resultado_logistico$casos_positivos,
-      resultado_logistico$casos_negativos
-    ),
-    
-    Random_Forest = c(
-      round(resultado_rf$auc, 7),
-      round(resultado_rf$accuracy, 7),
-      round(resultado_rf$sensitivity, 7),
-      round(resultado_rf$specificity, 7),
-      round(resultado_rf$precision, 7),
-      resultado_rf$n_celdas_train,
-      resultado_rf$n_celdas_test,
-      resultado_rf$casos_positivos,
-      resultado_rf$casos_negativos
-    ),
-    
-    XGBoost = c(
-      round(resultado_xgboost$auc, 7),
-      round(resultado_xgboost$accuracy, 7),
-      round(resultado_xgboost$sensitivity, 7),
-      round(resultado_xgboost$specificity, 7),
-      round(resultado_xgboost$precision, 7),
-      resultado_xgboost$n_celdas_train,
-      resultado_xgboost$n_celdas_test,
-      resultado_xgboost$casos_positivos,
-      resultado_xgboost$casos_negativos
-    )
-  )
-  
-  return(metricas)
-}
-
-```
-
-
-Veamos cual fue el mejor modelo para hurto.
-
-```{r}
-crear_tabla_comparativa(regLog_final_H,RF_final_H,XG_final_H)
-```
-
-Veamos las predicciones en términos de sus gráficos
-
-```{r}
-grid.arrange(regLog_final_H$grafico_reales, regLog_final_H$grafico_probabilidades, ncol = 2)
-
-```
-
-```{r}
-grid.arrange(RF_final_H$grafico_reales, RF_final_H$grafico_probabilidades, ncol = 2)
-```
-
-```{r}
-grid.arrange(XG_final_H$grafico_reales, XG_final_H$grafico_probabilidades, ncol = 2)
-```
-
-
-```{r}
-install.packages("cowplot")
-```
-
-
-
-Veamos cual fue el mejor modelo para robo.
-
-```{r}
-crear_tabla_comparativa(regLog_final_R,RF_final_R,XG_final_R)
-```
-
-
-```{r}
-grid.arrange(regLog_final_R$grafico_reales, regLog_final_R$grafico_probabilidades, ncol = 2)
-
-```
-
-```{r}
-grid.arrange(RF_final_R$grafico_reales, RF_final_R$grafico_probabilidades, ncol = 2)
-```
-
-```{r}
-grid.arrange(XG_final_R$grafico_reales, XG_final_R$grafico_probabilidades, ncol = 2)
-```
-
-Trabajo futuro: como Palermo es el barrio más peligroso de CABA encontramos que solo utilizando información espacial podíamos obtener buenos resultados para los modelos. De todos modos, no aprovechamos otras variables como franja o mes. Esto último recae en que deberíamos separar el análisis de acuerdo a las 24 franjas horarias del día o los 12 meses del año y queríamos hacer algo más simple. No obstante, si fueramos un ente estatal esto podría automatizarse con un workflow y/o AI agents y hacerse de forma dinámica y aportar información valiosa. A su vez, se podría expandir el análisis a los demás barrios de CABA pero en estos quizás haya que tener en cuenta más información dado que algunos no presentaban tantos delitos. Por último, también podría realizarse un análisis donde se tenga en cuenta los barrios colindantes y ver si hay alguna correlación entre los robos en Palermo y los barrios adyacentes.
-
-
-
